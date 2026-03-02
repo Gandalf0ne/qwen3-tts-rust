@@ -597,6 +597,10 @@ impl TtsEngine {
             full_audio
         });
 
+        // 连续静音检测参数
+        const MAX_SILENT_FRAMES: usize = 10; // 连续 10 帧静音则提前停止（约 0.83 秒）
+        let mut consecutive_silent_frames: usize = 0;
+
         for step in 0..self.max_steps {
             print!("\r    Generation Step {}/{}...", step + 1, self.max_steps);
             let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -623,6 +627,20 @@ impl TtsEngine {
                 println!("\n    EOS detected at step {} (code_0={})", step, code_0);
                 break;
             }
+            
+            // 连续静音检测：如果 code_0 为特定静音值，增加计数器
+            // 静音帧通常 code_0 在较低值范围（如 0-100）
+            let is_silent_frame = code_0 < 100;
+            if is_silent_frame {
+                consecutive_silent_frames += 1;
+                if consecutive_silent_frames >= MAX_SILENT_FRAMES {
+                    println!("\n    Early stop: {} consecutive silent frames detected", consecutive_silent_frames);
+                    break;
+                }
+            } else {
+                consecutive_silent_frames = 0;
+            }
+            
             all_codes.push(code_0);
 
             // Predictor
