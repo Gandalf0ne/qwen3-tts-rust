@@ -71,6 +71,10 @@ struct Args {
     /// Random seed for reproducibility (omit for random)
     #[arg(long)]
     seed: Option<u64>,
+
+    /// Enable streaming mode for prompt building
+    #[arg(long, default_value_t = false)]
+    streaming: bool,
 }
 
 #[tokio::main]
@@ -136,11 +140,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Generate
     let start_gen = Instant::now();
-    println!("Generating...");
+    println!("Generating... (streaming={})", args.streaming);
 
     // Generate
     let audio = engine
-        .generate_with_voice(&args.text, &voice, args.instruction.as_deref())
+        .generate_with_voice_streaming(&args.text, &voice, args.instruction.as_deref(), args.streaming)
         .map_err(|e| format!("Generation failed: {}", e))?;
 
     let gen_duration = start_gen.elapsed();

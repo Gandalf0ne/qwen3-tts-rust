@@ -345,8 +345,6 @@ impl AudioDecoder {
         state: &mut DecoderState,
         is_final: bool,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
-        // println!("  [ONNX] AudioDecoder: Decoding {} codes (is_final={})", codes.len(), is_final);
-
         let n_frames = codes.len() / 16;
         if n_frames == 0 {
             return Ok(vec![]);
@@ -394,12 +392,11 @@ impl AudioDecoder {
         // We assume safe to retrieve by name.
 
         // Handling valid_samples which might be scalar or 1D
-        // Handling valid_samples which might be scalar or 1D
         let valid_count = if let Some(valid_out) = outputs.get("valid_samples") {
             let valid_raw = valid_out.try_extract_tensor::<i64>()?;
             valid_raw.1[0] as usize
         } else {
-            wav_raw.1.len() // Fallback if not present (should be)
+            wav_raw.1.len()
         };
 
         let audio: Vec<f32> = wav_raw.1.iter().take(valid_count).cloned().collect();
