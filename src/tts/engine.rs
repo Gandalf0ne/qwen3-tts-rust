@@ -130,8 +130,8 @@ impl TtsEngine {
             _ => "gguf",
         };
 
-        // 1. Assets
-        let assets_path = model_dir.join(quant_dir);
+        // 1. Assets - 总是从未量化的 gguf 目录加载（assets 不应该被量化）
+        let assets_path = model_dir.join("gguf");
         let assets =
             Assets::load(&assets_path).map_err(|e| format!("Failed to load assets: {}", e))?;
 

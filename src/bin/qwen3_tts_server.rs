@@ -20,7 +20,7 @@ struct Args {
     #[arg(long, default_value = "models")]
     model_dir: PathBuf,
 
-    #[arg(long, default_value = "none")]
+    #[arg(long, default_value = "q5_k_m")]
     quant: String,
 
     #[arg(long, default_value = "speakers")]
