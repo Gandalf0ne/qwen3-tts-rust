@@ -493,6 +493,17 @@
                 audioWorkletNode = new AudioWorkletNode(audioContext, 'audio-processor');
                 audioWorkletNode.connect(audioContext.destination);
 
+                // 监听 AudioWorklet 消息
+                audioWorkletNode.port.onmessage = (event) => {
+                    if (event.data.type === 'buffer_drained') {
+                        console.log(`Buffer drained: played ${event.data.played}, received ${event.data.received}`);
+                        if (isStreaming) {
+                            stopStreaming();
+                            showStatus('流式播放完成', 'success');
+                        }
+                    }
+                };
+
                 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
                 ws = new WebSocket(`${protocol}//${window.location.host}/api/tts/stream`);
 
@@ -526,18 +537,14 @@
                         // 段完成信号
                         console.log('Segment done');
                     } else if (event.data === 'done') {
-                        // 服务端确认结束，等待缓冲区播放完毕
-                        console.log('All done, waiting for buffer to drain...');
+                        // 服务端确认结束，通知 AudioWorklet 开始排空
+                        console.log('All done, notifying AudioWorklet to drain...');
                         ws.close();
                         ws = null;
-                        // 不立即停止，让 AudioWorklet 继续播放缓冲区
-                        // 等待一段时间后清理
-                        setTimeout(() => {
-                            if (isStreaming) {
-                                stopStreaming();
-                                showStatus('流式播放完成', 'success');
-                            }
-                        }, 5000); // 5秒后清理
+                        // 通知 AudioWorklet 开始排空缓冲区
+                        if (audioWorkletNode) {
+                            audioWorkletNode.port.postMessage('drain');
+                        }
                     } else {
                         try {
                             const data = JSON.parse(event.data);

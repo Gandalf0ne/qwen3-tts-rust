@@ -14,6 +14,11 @@ class AudioProcessor extends AudioWorkletProcessor {
         this.lastSample = 0;
         this.isFirstChunk = true;
         
+        // 缓冲区状态
+        this.totalReceived = 0;
+        this.totalPlayed = 0;
+        this.isDraining = false;
+        
         this.port.onmessage = (event) => {
             const data = event.data;
             if (data instanceof Float32Array) {
@@ -30,12 +35,6 @@ class AudioProcessor extends AudioWorkletProcessor {
                             sample = this.lastSample * (1 - fadeRatio) + sample * fadeRatio;
                         }
                         
-                        // 淡出：最后几帧保存用于下次过渡
-                        if (i >= data.length - fadeLen) {
-                            const fadeRatio = (data.length - i) / fadeLen;
-                            // 不修改当前样本，只是记录
-                        }
-                        
                         this.buffer[this.writeIndex] = sample;
                         this.writeIndex = (this.writeIndex + 1) % this.bufferSize;
                         this.available++;
@@ -45,6 +44,10 @@ class AudioProcessor extends AudioWorkletProcessor {
                 // 保存最后一个样本用于下次淡入
                 this.lastSample = data[data.length - 1];
                 this.isFirstChunk = false;
+                this.totalReceived += data.length;
+            } else if (data === 'drain') {
+                // 标记为正在排空
+                this.isDraining = true;
             }
         };
     }
@@ -58,9 +61,16 @@ class AudioProcessor extends AudioWorkletProcessor {
                 channel[i] = this.buffer[this.readIndex];
                 this.readIndex = (this.readIndex + 1) % this.bufferSize;
                 this.available--;
+                this.totalPlayed++;
             } else {
                 channel[i] = 0;
             }
+        }
+
+        // 如果正在排空且缓冲区为空，通知主线程
+        if (this.isDraining && this.available === 0) {
+            this.port.postMessage({ type: 'buffer_drained', played: this.totalPlayed, received: this.totalReceived });
+            this.isDraining = false;
         }
 
         return true;
