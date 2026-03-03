@@ -540,7 +540,7 @@ impl TtsEngine {
             self.sampler_config.penalty_last_n,
         );
 
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool, usize)>();
+        let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
         let decoder_model_path = self
             .model_dir
             .join("onnx")
@@ -561,7 +561,7 @@ impl TtsEngine {
             let mut full_audio = Vec::new();
             let mut state = AudioDecoder::create_state();
 
-            while let Ok((codes, is_final, skip_frames)) = rx.recv() {
+            while let Ok((codes, is_final)) = rx.recv() {
                 let n_frames = codes.len() / 16;
                 if n_frames == 0 {
                     if is_final {
@@ -574,21 +574,10 @@ impl TtsEngine {
                 let safe_codes: Vec<i64> = codes.iter().map(|&c| c.clamp(0, 2047)).collect();
                 
                 if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final) {
-                    // 跳过开头的静音帧
-                    // 每帧 2000 个样本（24000 / 12 = 2000）
-                    let samples_per_frame = 2000;
-                    let skip_samples = skip_frames * samples_per_frame;
-                    
-                    let output_samples: Vec<f32> = samples
-                        .iter()
-                        .skip(skip_samples)
-                        .cloned()
-                        .collect();
-                    
                     if let Some(ref stx) = stream_tx {
-                        let _ = stx.send(output_samples.clone());
+                        let _ = stx.send(samples.clone());
                     }
-                    full_audio.extend(output_samples);
+                    full_audio.extend(samples);
                 }
                 
                 if is_final {
@@ -606,14 +595,11 @@ impl TtsEngine {
 
         // 流式发送参数
         // chunk_size = 12 的原因：
-        // - 音频开头有约 3 帧静音
         // - decoder 需要 latent_buffer，会吞掉后面 4 帧
-        // - chunk_size = 12 时，第一个 chunk 能得到 5 帧有声音的音频（12 - 3 - 4 = 5）
-        // - 5 帧约 400ms，能顺滑接上下一个 chunk
+        // - chunk_size = 12 时，第一个 chunk 能得到 8 帧有声音的音频（12 - 4 = 8）
+        // - 8 帧约 667ms，能顺滑接上下一个 chunk
         const SEND_INTERVAL: usize = 12; 
-        const INITIAL_SILENT_FRAMES: usize = 3; // 开头静音帧数，需要跳过
         let mut consecutive_silent_frames: usize = 0;
-        let mut is_first_chunk: bool = true;
 
         for step in 0..self.max_steps {
             print!("\r    Generation Step {}/{}...", step + 1, self.max_steps);
@@ -723,7 +709,7 @@ impl TtsEngine {
                 }
             }
 
-            // 每 4 帧发送一次，不包含上下文（解码器状态是连续的）
+            // 每 12 帧发送一次
             let current_frame = (all_codes.len() / 16) as usize;
             
             if current_frame >= SEND_INTERVAL && current_frame % SEND_INTERVAL == 0 {
@@ -739,16 +725,7 @@ impl TtsEngine {
                     .map(|&c| c as i64)
                     .collect();
                 
-                // 第一个 chunk 需要跳过开头的静音帧
-                let skip_frames = if is_first_chunk {
-                    is_first_chunk = false;
-                    INITIAL_SILENT_FRAMES
-                } else {
-                    0
-                };
-                
-                // 发送 (codes, is_final, skip_frames)
-                let _ = tx.send((frame_codes, false, skip_frames));
+                let _ = tx.send((frame_codes, false));
             }
 
             let mut feedback = vec![0.0f32; 2048];
@@ -801,16 +778,9 @@ impl TtsEngine {
                 .map(|&c| c as i64)
                 .collect();
             
-            // 最后一个 chunk，skip_frames 取决于是否是第一个 chunk
-            let skip_frames = if is_first_chunk {
-                INITIAL_SILENT_FRAMES
-            } else {
-                0
-            };
-            
-            let _ = tx.send((frame_codes, true, skip_frames));
+            let _ = tx.send((frame_codes, true));
         } else {
-            let _ = tx.send((Vec::new(), true, 0));
+            let _ = tx.send((Vec::new(), true));
         }
         drop(tx);
 
