@@ -572,15 +572,23 @@ impl TtsEngine {
                             .take(valid_len)
                             .map(|&c| c.clamp(0, 2047))
                             .collect();
-                        if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final) {
+                        if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final && code_buffer.len() == valid_len) {
                             if let Some(ref stx) = stream_tx {
                                 let _ = stx.send(samples.clone());
                             }
                             full_audio.extend(samples);
                         }
                         code_buffer.drain(0..valid_len);
-                    } else if is_final && !code_buffer.is_empty() {
-                        let remaining_codes: Vec<i64> = code_buffer.iter().map(|&c| c.clamp(0, 2047)).collect();
+                    }
+                    
+                    // 处理剩余不足 16 个的 codes（填充到 16）
+                    if is_final && !code_buffer.is_empty() {
+                        let mut remaining_codes: Vec<i64> = code_buffer.iter().map(|&c| c.clamp(0, 2047)).collect();
+                        // 填充到 16 的倍数
+                        let padding = 16 - (remaining_codes.len() % 16);
+                        if padding < 16 {
+                            remaining_codes.extend(std::iter::repeat(0).take(padding));
+                        }
                         if let Ok(samples) = local_decoder.decode(&remaining_codes, &mut state, true) {
                             if let Some(ref stx) = stream_tx {
                                 let _ = stx.send(samples.clone());
