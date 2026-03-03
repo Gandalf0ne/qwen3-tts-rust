@@ -1,8 +1,9 @@
 use axum::{
     extract::{DefaultBodyLimit, State, ws::{WebSocket, WebSocketUpgrade, Message}},
-    response::Html,
+    response::{Html, IntoResponse},
     Json, Router,
     routing::{get, post},
+    http::{header, StatusCode},
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
@@ -128,8 +129,11 @@ async fn index() -> Html<&'static str> {
     Html(include_str!("../../webui/index.html"))
 }
 
-async fn audio_processor() -> &'static str {
-    include_str!("../../webui/audio-processor.js")
+async fn audio_processor() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "application/javascript")],
+        include_str!("../../webui/audio-processor.js"),
+    )
 }
 
 async fn health() -> &'static str {
