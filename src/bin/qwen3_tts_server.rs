@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, State, ws::{WebSocket, WebSocketUpgrade, Message}},
     response::Html,
     Json, Router,
     routing::{get, post},
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
+use futures_util::StreamExt;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -96,6 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/tts", post(tts_handler))
+        .route("/api/tts/stream", get(tts_stream_handler))
         .route("/api/speakers", get(speakers_handler))
         .route("/health", get(health))
         .layer(
@@ -110,9 +112,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     println!("Server running at http://{}", addr);
     println!("API endpoints:");
-    println!("  POST /api/tts       - Generate TTS audio");
-    println!("  GET  /api/speakers  - List available speakers");
-    println!("  GET  /health        - Health check");
+    println!("  POST /api/tts        - Generate TTS audio (non-streaming)");
+    println!("  GET  /api/tts/stream - WebSocket streaming TTS");
+    println!("  GET  /api/speakers   - List available speakers");
+    println!("  GET  /health         - Health check");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -183,6 +186,7 @@ async fn tts_handler(
         &voice,
         req.instruction.as_deref(),
         streaming,
+        None,
     );
 
     match result {
@@ -206,4 +210,74 @@ async fn tts_handler(
             duration_ms: None,
         }),
     }
+}
+
+// WebSocket 流式 TTS 处理器
+async fn tts_stream_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    ws.on_upgrade(move |socket| handle_tts_stream(socket, state))
+}
+
+async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
+    // 等待客户端发送 TTS 请求
+    let msg = match socket.recv().await {
+        Some(Ok(msg)) => msg,
+        _ => return,
+    };
+
+    let text = match msg {
+        Message::Text(text) => text,
+        _ => return,
+    };
+
+    let req: TTSRequest = match serde_json::from_str(&text) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socket.send(Message::Text(format!("{{\"error\": \"Invalid request: {}\"}}", e))).await;
+            return;
+        }
+    };
+
+    let speaker_name = req.speaker.unwrap_or_else(|| "vivian".to_string());
+    let voice = match state.speakers.get(&speaker_name).cloned() {
+        Some(v) => v,
+        None => {
+            let _ = socket.send(Message::Text(format!("{{\"error\": \"Speaker '{}' not found\"}}", speaker_name))).await;
+            return;
+        }
+    };
+
+    // 创建音频流通道
+    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
+
+    // 在单独的线程中生成音频
+    let engine = state.engine.clone();
+    let text_clone = req.text.clone();
+    let instruction = req.instruction.clone();
+
+    let generate_handle = tokio::task::spawn_blocking(move || {
+        let mut engine = engine.blocking_lock();
+        engine.generate_with_voice_streaming(&text_clone, &voice, instruction.as_deref(), true, Some(audio_tx))
+    });
+
+    // 发送音频数据到 WebSocket
+    while let Ok(samples) = audio_rx.recv() {
+        // 将 f32 样本转换为字节
+        let bytes: Vec<u8> = samples
+            .iter()
+            .flat_map(|s| s.to_le_bytes())
+            .collect();
+
+        if socket.send(Message::Binary(bytes)).await.is_err() {
+            break;
+        }
+    }
+
+    // 发送结束标记
+    let _ = socket.send(Message::Text("done".to_string())).await;
+
+    // 等待生成任务完成
+    let _ = generate_handle.await;
 }

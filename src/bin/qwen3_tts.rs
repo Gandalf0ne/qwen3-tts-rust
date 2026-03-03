@@ -144,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Generate
     let audio = engine
-        .generate_with_voice_streaming(&args.text, &voice, args.instruction.as_deref(), args.streaming)
+        .generate_with_voice_streaming(&args.text, &voice, args.instruction.as_deref(), args.streaming, None)
         .map_err(|e| format!("Generation failed: {}", e))?;
 
     let gen_duration = start_gen.elapsed();

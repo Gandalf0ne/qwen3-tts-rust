@@ -440,7 +440,7 @@ impl TtsEngine {
         voice: &crate::VoiceFile,
         instruct: Option<&str>,
     ) -> Result<AudioSample, String> {
-        self.generate_with_voice_streaming(text, voice, instruct, false)
+        self.generate_with_voice_streaming(text, voice, instruct, false, None)
     }
 
     /// Generate speech using a pre-loaded VoiceFile with optional streaming mode.
@@ -450,6 +450,7 @@ impl TtsEngine {
         voice: &crate::VoiceFile,
         instruct: Option<&str>,
         streaming: bool,
+        stream_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
     ) -> Result<AudioSample, String> {
         let prompt_data = if voice.audio_codes.is_empty() {
             PromptBuilder::build_core(
@@ -479,7 +480,7 @@ impl TtsEngine {
             ))
         }?;
 
-        self.run_inference(prompt_data)
+        self.run_inference_stream(prompt_data, stream_tx)
     }
 
     fn run_inference(
