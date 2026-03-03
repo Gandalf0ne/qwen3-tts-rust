@@ -477,12 +477,6 @@
             document.getElementById('audioContainer').classList.add('hidden');
             hideStatus();
 
-            // 按句号、问号、感叹号分段
-            const segments = text.split(/(?<=[。！？.!?])/g).filter(s => s.trim());
-            if (segments.length === 0) {
-                segments.push(text);
-            }
-
             try {
                 // 创建 AudioContext（需要用户交互后才能播放）
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
@@ -506,38 +500,24 @@
 
                 let segmentIndex = 0;
                 let sendInterval;
-                let charsToSend = [];
-                let charIndex = 0;
 
-                // 将文本分成初始块和逐字发送的部分
-                // 前几个字作为初始缓冲，剩余的一个字一个字发送
-                const initialChars = 5; // 初始发送5个字
-                const charInterval = 100; // 每100ms发送一个字
-
-                // 准备发送计划
-                const fullText = text;
-                if (fullText.length <= initialChars) {
-                    // 文本很短，一次性发送
-                    charsToSend = [fullText];
-                } else {
-                    // 初始块
-                    charsToSend.push(fullText.substring(0, initialChars));
-                    // 剩余的逐字发送
-                    for (let i = initialChars; i < fullText.length; i++) {
-                        charsToSend.push(fullText[i]);
-                    }
+                // 按标点符号分段发送
+                // 分段规则：按句号、问号、感叹号、逗号、顿号等分割
+                const segments = text.split(/(?<=[。！？，、；：,.!?;:])/g).filter(s => s.trim());
+                if (segments.length === 0) {
+                    segments.push(text);
                 }
 
                 // 初始化进度显示
                 let sentTextContent = '';
                 document.getElementById('sentText').textContent = '';
-                document.getElementById('pendingText').textContent = fullText;
+                document.getElementById('pendingText').textContent = text;
 
-                const sendNextChunk = () => {
-                    if (charIndex < charsToSend.length) {
-                        const chunk = charsToSend[charIndex];
+                const sendNextSegment = () => {
+                    if (segmentIndex < segments.length) {
+                        const segment = segments[segmentIndex];
                         ws.send(JSON.stringify({
-                            text: chunk,
+                            text: segment,
                             speaker,
                             temperature,
                             top_k,
@@ -546,13 +526,13 @@
                         }));
                         
                         // 更新进度显示
-                        sentTextContent += chunk;
+                        sentTextContent += segment;
                         document.getElementById('sentText').textContent = sentTextContent;
-                        document.getElementById('pendingText').textContent = fullText.substring(sentTextContent.length);
+                        document.getElementById('pendingText').textContent = text.substring(sentTextContent.length);
                         
-                        charIndex++;
+                        segmentIndex++;
                     } else {
-                        // 所有文本已发送，停止定时器
+                        // 所有段已发送，停止定时器
                         clearInterval(sendInterval);
                         // 发送结束信号
                         ws.send('end');
@@ -560,14 +540,11 @@
                 };
 
                 ws.onopen = () => {
-                    // 立即发送初始块
-                    sendNextChunk();
-                    // 然后定时发送剩余的字
-                    if (charsToSend.length > 1) {
-                        sendInterval = setInterval(sendNextChunk, charInterval);
-                    } else {
-                        // 只有一块，直接结束
-                        ws.send('end');
+                    // 立即发送第一段
+                    sendNextSegment();
+                    // 每 200ms 发送下一段
+                    if (segments.length > 1) {
+                        sendInterval = setInterval(sendNextSegment, 200);
                     }
                 };
 
