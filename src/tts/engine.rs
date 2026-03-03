@@ -606,8 +606,9 @@ impl TtsEngine {
         });
 
         // 连续静音检测参数
-        const MAX_SILENT_FRAMES: usize = 10; // 连续 10 帧静音则提前停止（约 0.83 秒）
-        const SILENT_PENALTY_THRESHOLD: usize = 3; // 连续 3 帧静音后开始施加惩罚
+        // 逗号停顿约 3-4 帧（0.3秒），句号停顿约 7-8 帧（0.6秒）
+        const MAX_SILENT_FRAMES: usize = 15; // 连续 15 帧静音则提前停止（约 1.25 秒）
+        const SILENT_PENALTY_THRESHOLD: usize = 8; // 连续 8 帧静音后开始施加惩罚（超过句号停顿）
         const SILENT_PENALTY_VALUE: f32 = 2.0; // 静音惩罚值
         let mut consecutive_silent_frames: usize = 0;
 
@@ -656,7 +657,7 @@ impl TtsEngine {
             
             // 连续静音检测：如果 code_0 为特定静音值，增加计数器
             // 静音帧通常 code_0 在较低值范围（如 0-100）
-            // 正常逗号停顿约 3 帧，超过 3 帧后施加静音惩罚
+            // 逗号停顿约 3-4 帧，句号停顿约 7-8 帧，超过 8 帧后施加静音惩罚
             let is_silent_frame = code_0 < 100;
             if is_silent_frame {
                 consecutive_silent_frames += 1;
