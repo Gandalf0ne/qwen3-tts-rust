@@ -851,6 +851,139 @@ impl LlamaSampler {
             result
         }
     }
+
+    /// 采样时对静音 token 施加惩罚
+    /// silent_penalty: 静音惩罚系数（0-1），降低静音 token 的概率
+    /// silent_threshold: 静音 token 的阈值（code_0 < silent_threshold 被视为静音）
+    pub fn sample_with_silent_penalty(
+        &self,
+        ctx: &LlamaContext,
+        idx: i32,
+        limit_start: Option<usize>,
+        limit_end: Option<usize>,
+        allow_tokens: Option<&[LlamaToken]>,
+        silent_penalty: f32,
+        silent_threshold: usize,
+    ) -> LlamaToken {
+        let ffi = get_ffi();
+        unsafe {
+            let offset = if idx >= 0 { idx as usize } else { 0 };
+            let base_ptr = (ffi.llama_get_logits)(ctx.ptr);
+            let logits_ptr = base_ptr.add(offset * self.n_vocab);
+
+            let logits_raw = std::slice::from_raw_parts(logits_ptr, self.n_vocab);
+            let mut logits: Vec<f32> = logits_raw.to_vec();
+
+            let start = limit_start.unwrap_or(0);
+            let end = limit_end.unwrap_or(self.n_vocab).min(self.n_vocab);
+
+            // 创建掩码
+            let mut mask = vec![true; self.n_vocab];
+            for m in mask.iter_mut().take(end).skip(start) {
+                *m = false;
+            }
+            if let Some(allow) = allow_tokens {
+                for &token in allow {
+                    let t = token as usize;
+                    if t < self.n_vocab {
+                        mask[t] = false;
+                    }
+                }
+            }
+            for (i, &m) in mask.iter().enumerate() {
+                if m {
+                    logits[i] = self._neg_inf;
+                }
+            }
+
+            // 对静音 token 施加惩罚（降低 logits）
+            if silent_penalty > 0.0 {
+                for i in 0..silent_threshold.min(end) {
+                    if !mask[i] {
+                        logits[i] -= silent_penalty;
+                    }
+                }
+            }
+
+            self.apply_penalties(&mut logits);
+
+            if self.temperature <= 0.0 {
+                let mut max_val = f32::NEG_INFINITY;
+                let mut max_idx = 0;
+
+                for (i, &val) in logits.iter().enumerate() {
+                    if val > max_val {
+                        max_val = val;
+                        max_idx = i;
+                    }
+                }
+                self.accept(max_idx as LlamaToken);
+                return max_idx as LlamaToken;
+            }
+
+            let mut candidates: Vec<(usize, f32)> = logits
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| v > f32::NEG_INFINITY / 2.0)
+                .map(|(i, &v)| (i, v))
+                .collect();
+
+            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            if self.top_k > 0 && self.top_k < candidates.len() {
+                candidates.truncate(self.top_k);
+            }
+
+            let max_logit = candidates.first().map(|(_, l)| *l).unwrap_or(0.0);
+            let mut probs: Vec<(usize, f32)> = candidates
+                .iter()
+                .map(|(idx, logit)| {
+                    let scaled = (*logit - max_logit) / self.temperature;
+                    (*idx, scaled.exp())
+                })
+                .collect();
+
+            let sum: f32 = probs.iter().map(|(_, p)| *p).sum();
+            if sum > 0.0 {
+                for (_, p) in probs.iter_mut() {
+                    *p /= sum;
+                }
+            }
+
+            self.apply_min_p(&mut probs);
+
+            if self.top_p < 1.0 {
+                let mut cumsum = 0.0;
+                let mut cutoff_idx = probs.len();
+                for (i, (_, p)) in probs.iter().enumerate() {
+                    cumsum += p;
+                    if cumsum > self.top_p {
+                        cutoff_idx = i + 1;
+                        break;
+                    }
+                }
+                probs.truncate(cutoff_idx);
+            }
+
+            use rand::Rng;
+            let r: f32 = self.rng.borrow_mut().gen();
+            let mut cumsum = 0.0;
+            for (idx, p) in probs.iter() {
+                cumsum += p;
+                if r < cumsum {
+                    self.accept(*idx as LlamaToken);
+                    return *idx as LlamaToken;
+                }
+            }
+
+            let result = probs
+                .first()
+                .map(|(idx, _)| *idx as LlamaToken)
+                .unwrap_or(start as LlamaToken);
+            self.accept(result);
+            result
+        }
+    }
 }
 impl Drop for LlamaSampler {
     fn drop(&mut self) {}

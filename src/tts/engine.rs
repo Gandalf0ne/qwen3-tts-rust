@@ -607,6 +607,8 @@ impl TtsEngine {
 
         // 连续静音检测参数
         const MAX_SILENT_FRAMES: usize = 10; // 连续 10 帧静音则提前停止（约 0.83 秒）
+        const SILENT_PENALTY_THRESHOLD: usize = 3; // 连续 3 帧静音后开始施加惩罚
+        const SILENT_PENALTY_VALUE: f32 = 2.0; // 静音惩罚值
         let mut consecutive_silent_frames: usize = 0;
 
         for step in 0..self.max_steps {
@@ -623,13 +625,29 @@ impl TtsEngine {
             // 白名单：允许 EOS(2150)、PAD(2148)、BOS(2149) 被采样到
             // 这确保即使这些 token 在范围外，也可以被采样到
             let allow_tokens: Vec<i32> = vec![2150, 2148, 2149];
-            let code_0 = talker_sampler.sample_with_allow(
-                &self.talker_ctx, 
-                sample_idx, 
-                Some(0), 
-                Some(2048), 
-                Some(&allow_tokens)
-            );
+            
+            // 如果连续静音帧超过阈值，施加静音惩罚
+            let code_0 = if consecutive_silent_frames >= SILENT_PENALTY_THRESHOLD {
+                // 静音惩罚随连续静音帧数增加而增加
+                let penalty = SILENT_PENALTY_VALUE * (1.0 + (consecutive_silent_frames - SILENT_PENALTY_THRESHOLD) as f32 * 0.5);
+                talker_sampler.sample_with_silent_penalty(
+                    &self.talker_ctx, 
+                    sample_idx, 
+                    Some(0), 
+                    Some(2048), 
+                    Some(&allow_tokens),
+                    penalty,
+                    100, // code_0 < 100 被视为静音
+                )
+            } else {
+                talker_sampler.sample_with_allow(
+                    &self.talker_ctx, 
+                    sample_idx, 
+                    Some(0), 
+                    Some(2048), 
+                    Some(&allow_tokens)
+                )
+            };
 
             if code_0 == 2150 || code_0 == 151673 {
                 println!("\n    EOS detected at step {} (code_0={})", step, code_0);
@@ -638,6 +656,7 @@ impl TtsEngine {
             
             // 连续静音检测：如果 code_0 为特定静音值，增加计数器
             // 静音帧通常 code_0 在较低值范围（如 0-100）
+            // 正常逗号停顿约 3 帧，超过 3 帧后施加静音惩罚
             let is_silent_frame = code_0 < 100;
             if is_silent_frame {
                 consecutive_silent_frames += 1;
