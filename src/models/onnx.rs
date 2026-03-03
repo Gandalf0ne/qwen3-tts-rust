@@ -61,6 +61,31 @@ fn create_cpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
     Ok(session)
 }
 
+/// 创建 GPU Session (DirectML)
+#[cfg(windows)]
+fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
+    println!("  [ONNX] Requesting Execution Providers: DirectML");
+    let builder = Session::builder()?;
+    println!("  [ONNX] Session Builder created.");
+
+    let builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)?;
+
+    // 尝试 DirectML
+    let dml = ort::execution_providers::DirectMLExecutionProvider::default().build();
+    match builder.with_execution_providers([dml]) {
+        Ok(builder) => {
+            println!("  [ONNX] DirectML Provider configured.");
+            let session = builder.commit_from_file(model_path)?;
+            println!("  [ONNX] DirectML Session committed.");
+            Ok(session)
+        }
+        Err(_) => {
+            println!("  [ONNX] DirectML failed, falling back to CPU.");
+            create_cpu_session(model_path)
+        }
+    }
+}
+
 /// 打印当前使用的执行提供者信息
 fn print_session_info(session: &Session, name: &str) {
     let inputs: Vec<_> = session
@@ -329,7 +354,13 @@ impl AudioDecoder {
     pub fn load(model_path: &str) -> Result<Self, Box<dyn Error>> {
         println!("  [ONNX] AudioDecoder: Loading {}", model_path);
 
+        // Windows 上尝试使用 DirectML 加速
+        #[cfg(windows)]
+        let session = create_gpu_session(model_path)?;
+        
+        #[cfg(not(windows))]
         let session = create_cpu_session(model_path)?;
+        
         print_session_info(&session, "AudioDecoder");
 
         Ok(AudioDecoder { session })
