@@ -479,9 +479,15 @@
             }
 
             try {
+                // 创建 AudioContext（需要用户交互后才能播放）
                 audioContext = new (window.AudioContext || window.webkitAudioContext)({
                     sampleRate: 24000
                 });
+                
+                // 确保 AudioContext 是运行状态
+                if (audioContext.state === 'suspended') {
+                    await audioContext.resume();
+                }
                 
                 await audioContext.audioWorklet.addModule('/audio-processor.js');
                 
@@ -512,9 +518,11 @@
                     if (event.data instanceof ArrayBuffer) {
                         // 音频数据
                         const float32Data = new Float32Array(event.data);
+                        console.log('Received audio data:', float32Data.length, 'samples');
                         audioWorkletNode.port.postMessage(float32Data);
                     } else if (event.data === 'segment_done') {
                         // 当前段完成，发送下一段
+                        console.log('Segment done, sending next...');
                         if (segmentIndex < segments.length) {
                             ws.send(JSON.stringify({
                                 text: segments[segmentIndex],
@@ -531,6 +539,7 @@
                         }
                     } else if (event.data === 'done') {
                         // 服务端确认结束
+                        console.log('All done');
                         stopStreaming();
                         showStatus('流式播放完成', 'success');
                     } else {
@@ -542,7 +551,6 @@
                             }
                         } catch (e) {}
                     }
-                };
                 };
 
                 ws.onerror = (error) => {
