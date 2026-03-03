@@ -327,9 +327,9 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
         // 发送文本到生成线程
         let _ = text_tx.send((text_to_generate.to_string(), current_speaker.clone()));
 
-        // 接收音频数据
+        // 接收音频数据，持续直到收到段完成信号
         loop {
-            match audio_rx.try_recv() {
+            match audio_rx.recv_timeout(std::time::Duration::from_millis(100)) {
                 Ok(samples) => {
                     if samples.is_empty() {
                         // 段完成信号
@@ -346,13 +346,16 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                 }
-                Err(TryRecvError::Empty) => {
-                    // 等待一下再试
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // 超时，继续等待
+                    continue;
                 }
-                Err(TryRecvError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        
+        // 等待一小段时间，确保所有音频数据都已发送
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     // 清理
