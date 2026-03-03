@@ -230,14 +230,10 @@ async fn tts_stream_handler(
 }
 
 async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
-    use std::sync::mpsc::TryRecvError;
-    
     // 文本段通道：前端 -> 生成线程
     let (text_tx, text_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
     // 音频通道：生成线程 -> 前端
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-    // 控制通道：通知生成线程停止
-    let (control_tx, control_rx) = std::sync::mpsc::channel::<bool>();
     
     // 克隆需要的变量
     let engine = state.engine.clone();
@@ -266,7 +262,7 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
             
             let voice_ref = voice.as_ref().unwrap();
             
-            // 生成音频（会阻塞直到解码完成）
+            // 生成音频
             let result = engine.generate_with_voice_streaming(
                 &text, 
                 voice_ref, 
@@ -279,7 +275,6 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
                 break;
             }
             
-            // generate_with_voice_streaming 返回后，所有音频数据已发送
             // 发送段完成信号（通过空 vec）
             let _ = audio_tx.send(vec![]);
         }
@@ -328,10 +323,11 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
         // 发送文本到生成线程
         let _ = text_tx.send((text_to_generate.to_string(), current_speaker.clone()));
 
-        // 接收音频数据，持续直到收到段完成信号
-        // 使用更长的超时时间，确保不会丢失数据
+        // 接收音频数据
+        // 由于 std::sync::mpsc::Receiver 不能在异步上下文中直接使用
+        // 我们使用 try_recv 配合 sleep 来实现非阻塞接收
         loop {
-            match audio_rx.recv_timeout(std::time::Duration::from_millis(1000)) {
+            match audio_rx.try_recv() {
                 Ok(samples) => {
                     if samples.is_empty() {
                         // 段完成信号
@@ -348,13 +344,13 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // 超时，继续等待
-                    eprintln!("Warning: audio receive timeout, continuing...");
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    // 没有数据，等待一下
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    eprintln!("Audio channel disconnected");
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    // 通道关闭
                     break;
                 }
             }
@@ -362,7 +358,6 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
     }
 
     // 清理
-    let _ = control_tx.send(true);
     let _ = text_tx.send((String::new(), None));
     let _ = generate_thread.join();
     
