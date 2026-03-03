@@ -247,6 +247,11 @@
                 <label for="text">输入要合成的文本：</label>
                 <textarea id="text" placeholder="请输入要转换的文本...">你好，这是一个测试。</textarea>
             </div>
+            <div class="form-group">
+                <label for="instruction">指令风格 (可选)：</label>
+                <input type="text" id="instruction" placeholder="例如: Happy, Sad, Excited, Calm...">
+                <div class="info-text">添加情感风格指令，留空则无</div>
+            </div>
         </div>
 
         <div class="card">
@@ -277,6 +282,11 @@
                     <label for="seed">随机种子</label>
                     <input type="number" id="seed" placeholder="留空为随机">
                     <div class="info-text">相同种子产生相同结果</div>
+                </div>
+                <div class="form-group">
+                    <label for="maxSteps">最大步数</label>
+                    <input type="number" id="maxSteps" value="512" min="64" max="2048" step="64">
+                    <div class="info-text">生成最大 token 数</div>
                 </div>
                 <div class="form-group">
                     <div class="checkbox-group" style="margin-top: 24px;">
@@ -408,6 +418,8 @@
             const top_k = parseInt(document.getElementById('top_k').value) || 50;
             const top_p = parseFloat(document.getElementById('top_p').value) || 1.0;
             const seed = document.getElementById('seed').value ? parseInt(document.getElementById('seed').value) : null;
+            const maxSteps = parseInt(document.getElementById('maxSteps').value) || 512;
+            const instruction = document.getElementById('instruction').value.trim() || null;
             const streaming = document.getElementById('streaming').checked;
 
             setGenerating(true);
@@ -430,6 +442,8 @@
                         top_k,
                         top_p,
                         seed,
+                        max_steps: maxSteps,
+                        instruction,
                     }),
                     signal: currentController.signal,
                 });
@@ -471,6 +485,7 @@
             const top_k = parseInt(document.getElementById('top_k').value) || 50;
             const top_p = parseFloat(document.getElementById('top_p').value) || 1.0;
             const seed = document.getElementById('seed').value ? parseInt(document.getElementById('seed').value) : null;
+            const instruction = document.getElementById('instruction').value.trim() || null;
 
             setGenerating(true);
             document.getElementById('streamingStatus').classList.remove('hidden');
@@ -522,6 +537,7 @@
                         top_k,
                         top_p,
                         seed,
+                        instruction,
                     }));
                     // 发送结束信号
                     ws.send('end');

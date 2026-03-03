@@ -48,6 +48,7 @@ struct TTSRequest {
     top_p: Option<f32>,
     seed: Option<u64>,
     instruction: Option<String>,
+    max_steps: Option<usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -188,6 +189,11 @@ async fn tts_handler(
             new_config.seed = Some(seed);
         }
         engine.set_sampler_config(new_config);
+    }
+
+    // 设置 max_steps
+    if let Some(max_steps) = req.max_steps {
+        engine.set_max_steps(max_steps);
     }
 
     let result = engine.generate_with_voice_streaming(
