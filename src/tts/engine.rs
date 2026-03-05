@@ -8,6 +8,7 @@ use crate::utils::voice_file::VoiceFile;
 use crate::AudioSample;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Sampler configuration for TTS generation
 #[derive(Debug, Clone)]
@@ -92,6 +93,7 @@ pub struct TtsEngine {
     // ONNX Models
     encoder: Option<AudioEncoder>,
     speaker_encoder: Option<SpeakerEncoder>,
+    decoder: Arc<Mutex<AudioDecoder>>,
     // Llama: Contexts MUST be listed before models for correct drop order
     talker_ctx: LlamaContext,
     predictor_ctx: LlamaContext,
@@ -102,7 +104,7 @@ pub struct TtsEngine {
     speakers: HashMap<String, VoiceFile>,
 
     // Config
-    model_dir: PathBuf,
+    _model_dir: PathBuf,
     max_steps: usize,
     sampler_config: SamplerConfig,
 }
@@ -117,7 +119,12 @@ impl TtsEngine {
     ///
     /// * `model_dir` - Path to the directory containing model files.
     /// * `quant` - Quantization level (e.g., "none", "q5_k_m", "q8_0").
-    pub async fn new(model_dir: impl AsRef<Path>, quant: &str) -> Result<Self, String> {
+    /// * `n_threads` - Number of threads to use for generation (default: 4 if <= 0).
+    pub async fn new(
+        model_dir: impl AsRef<Path>,
+        quant: &str,
+        _n_threads: i32,
+    ) -> Result<Self, String> {
         let model_dir = model_dir.as_ref();
         println!("Loading TtsEngine from: {:?} (quant: {})", model_dir, quant);
 
@@ -166,19 +173,20 @@ impl TtsEngine {
             .map_err(|e| format!("Failed to load Predictor: {}", e))?;
 
         // 5. Create Contexts
+        // talker: n_ctx=4096, n_batch=2048, embeddings=1, threads=-1 (auto)
         let talker_ctx = LlamaContext::new(&talker_model, 4096, 2048, 1, -1)
             .map_err(|e| format!("Failed to create Talker context: {}", e))?;
 
+        // predictor: n_ctx=512, n_batch=32, embeddings=0, threads=4
         let predictor_ctx = LlamaContext::new(&predictor_model, 512, 32, 0, 4)
             .map_err(|e| format!("Failed to create Predictor context: {}", e))?;
 
         // 6. 预加载 decoder（预热）
         println!("Pre-loading AudioDecoder...");
-        let _decoder = AudioDecoder::load(
-            &onnx_dir
-                .join("qwen3_tts_decoder.onnx")
-                .to_string_lossy(),
-        ).map_err(|e| format!("Failed to load AudioDecoder: {}", e))?;
+        let decoder =
+            AudioDecoder::load(&onnx_dir.join("qwen3_tts_decoder.onnx").to_string_lossy())
+                .map_err(|e| format!("Failed to load AudioDecoder: {}", e))?;
+        let decoder = Arc::new(Mutex::new(decoder));
         println!("AudioDecoder pre-loaded and warmed up.");
 
         println!("TtsEngine loaded successfully.");
@@ -188,13 +196,14 @@ impl TtsEngine {
             tokenizer,
             encoder,
             speaker_encoder,
+            decoder,
             talker_model,
             predictor_model,
             talker_ctx,
             predictor_ctx,
             speakers: HashMap::new(),
-            model_dir: model_dir.to_path_buf(),
-            max_steps: 512,
+            _model_dir: model_dir.to_path_buf(),
+            max_steps: 4096,
             sampler_config: SamplerConfig::default(),
         };
 
@@ -321,7 +330,6 @@ impl TtsEngine {
             &spk_emb,
             2055,
             instruct,
-            false,
         );
 
         self.run_inference(prompt_data)
@@ -449,17 +457,16 @@ impl TtsEngine {
         voice: &crate::VoiceFile,
         instruct: Option<&str>,
     ) -> Result<AudioSample, String> {
-        self.generate_with_voice_streaming(text, voice, instruct, false, None)
+        self.generate_with_voice_streaming(text, voice, instruct, None)
     }
 
-    /// Generate speech using a pre-loaded VoiceFile with optional streaming mode.
+    /// Generate speech using a pre-loaded VoiceFile.
     pub fn generate_with_voice_streaming(
         &mut self,
         text: &str,
         voice: &crate::VoiceFile,
         instruct: Option<&str>,
-        streaming: bool,
-        stream_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
+        stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<f32>>>,
     ) -> Result<AudioSample, String> {
         let prompt_data = if voice.audio_codes.is_empty() {
             PromptBuilder::build_core(
@@ -485,7 +492,6 @@ impl TtsEngine {
                 &voice.speaker_embedding,
                 2055,
                 instruct,
-                streaming,
             ))
         }?;
 
@@ -502,7 +508,7 @@ impl TtsEngine {
     fn run_inference_stream(
         &mut self,
         prompt_data: crate::tts::prompt::PromptData,
-        stream_tx: Option<std::sync::mpsc::Sender<Vec<f32>>>,
+        stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<f32>>>,
     ) -> Result<AudioSample, String> {
         self.talker_ctx.clear_kv_cache();
         self.predictor_ctx.clear_kv_cache();
@@ -511,8 +517,6 @@ impl TtsEngine {
         let prompt_embeds_flat: Vec<f32> = prompt_data.embd.iter().flatten().copied().collect();
         let talker_embd = self.talker_model.n_embd;
         let predictor_embd = self.predictor_model.n_embd;
-
-        let trailing_text_pool = prompt_data.trailing_text_embd;
 
         let mut talker_batch = LlamaBatch::new(4096, talker_embd, 1, 4);
         let pos_arr = Self::qwen3_position(0, n_tokens_prompt);
@@ -540,74 +544,61 @@ impl TtsEngine {
             self.sampler_config.top_k,
             self.sampler_config.top_p,
             seed,
-        )
-        .with_penalties(
-            self.sampler_config.min_p,
-            self.sampler_config.repeat_penalty,
-            self.sampler_config.frequency_penalty,
-            self.sampler_config.presence_penalty,
-            self.sampler_config.penalty_last_n,
         );
 
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
-        let decoder_model_path = self
-            .model_dir
-            .join("onnx")
-            .join("qwen3_tts_decoder.onnx")
-            .to_string_lossy()
-            .to_string();
 
         let tts_pad = self.assets.tts_pad.clone();
+        let decoder_arc = self.decoder.clone();
 
         let decoder_handle = std::thread::spawn(move || {
-            let mut local_decoder = match AudioDecoder::load(&decoder_model_path) {
-                Ok(d) => d,
-                Err(e) => {
-                    eprintln!("Failed to load decoder in thread: {}", e);
-                    return Vec::new();
-                }
-            };
             let mut full_audio = Vec::new();
             let mut state = AudioDecoder::create_state();
 
             while let Ok((codes, is_final)) = rx.recv() {
                 let n_frames = codes.len() / 16;
+
                 if n_frames == 0 {
                     if is_final {
+                        let mut local_decoder = decoder_arc.lock().unwrap();
+                        if let Ok(samples) = local_decoder.decode(&[], &mut state, true) {
+                            if !samples.is_empty() {
+                                if let Some(ref stx) = stream_tx {
+                                    let _ = stx.send(samples.clone());
+                                }
+                                full_audio.extend(samples);
+                            }
+                        }
                         break;
                     }
                     continue;
                 }
 
-                // 解码整个 chunk
                 let safe_codes: Vec<i64> = codes.iter().map(|&c| c.clamp(0, 2047)).collect();
-                
+
+                let mut local_decoder = decoder_arc.lock().unwrap();
                 if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final) {
-                    if let Some(ref stx) = stream_tx {
-                        let _ = stx.send(samples.clone());
+                    if !samples.is_empty() {
+                        if let Some(ref stx) = stream_tx {
+                            let _ = stx.send(samples.clone());
+                        }
+                        full_audio.extend(samples);
                     }
-                    full_audio.extend(samples);
                 }
-                
-                // 不要在 is_final 时立即 break，让循环自然结束
-                // 因为最后一批数据已经发送了
             }
             full_audio
         });
 
-        // 连续静音检测参数
-        // 齿顿约 3-4 帧（0.3秒）
-        const MAX_SILENT_FRAMES: usize = 15; // 连续 15 帧静音则提前停止（约 1.25 秒）
-        const SILENT_PENALTY_THRESHOLD: usize = 8; // 连续 8 帧静音后开始施加惩罚
-        const SILENT_PENALTY_VALUE: f32 = 2.0; // 静音惩罚值
+        // 连续静音检测参数 (12.5Hz = 80ms/帧)
+        const MAX_SILENT_FRAMES: usize = 15; // 1.2秒强制停止
+        const SILENT_PENALTY_THRESHOLD: usize = 4; // 0.3秒(4帧)后开始惩罚
+        const SILENT_PENALTY_MAX_FRAMES: usize = 8; // 0.6秒(8帧)后极大惩罚
+        const SILENT_PENALTY_VALUE: f32 = 2.0;
 
         // 流式发送参数
-        // chunk_size = 4 的原因：
-        // - 更频繁的发送，减少延迟
-        // - decoder 需要 latent_buffer，会吞掉后面几帧
-        // - 4 帧约 333ms，能快速开始播放
-        const SEND_INTERVAL: usize = 4; 
+        const SEND_INTERVAL: usize = 4;
         let mut consecutive_silent_frames: usize = 0;
+        let mut last_sent_frame: usize = 0;
 
         for step in 0..self.max_steps {
             print!("\r    Generation Step {}/{}...", step + 1, self.max_steps);
@@ -619,53 +610,68 @@ impl TtsEngine {
             } else {
                 0
             };
-            
-            // 白名单：允许 EOS(2150)、PAD(2148)、BOS(2149) 被采样到
-            // 这确保即使这些 token 在范围外，也可以被采样到
+
             let allow_tokens: Vec<i32> = vec![2150, 2148, 2149];
-            
-            // 如果连续静音帧超过阈值，施加静音惩罚
+
             let code_0 = if consecutive_silent_frames >= SILENT_PENALTY_THRESHOLD {
-                // 静音惩罚随连续静音帧数增加而增加
-                let penalty = SILENT_PENALTY_VALUE * (1.0 + (consecutive_silent_frames - SILENT_PENALTY_THRESHOLD) as f32 * 0.5);
+                let penalty = if consecutive_silent_frames >= SILENT_PENALTY_MAX_FRAMES {
+                    100.0 // 极大惩罚，强制退出静音
+                } else {
+                    SILENT_PENALTY_VALUE
+                        * (1.0
+                            + (consecutive_silent_frames - SILENT_PENALTY_THRESHOLD) as f32 * 0.5)
+                };
+                eprintln!(
+                    "[Debug] silent {} frames, penalty: {:.1}",
+                    consecutive_silent_frames, penalty
+                );
                 talker_sampler.sample_with_silent_penalty(
-                    &self.talker_ctx, 
-                    sample_idx, 
-                    Some(0), 
-                    Some(2048), 
+                    &self.talker_ctx,
+                    sample_idx,
+                    Some(0),
+                    Some(2048),
                     Some(&allow_tokens),
                     penalty,
-                    100, // code_0 < 100 被视为静音
+                    SILENT_PENALTY_MAX_FRAMES, // 只对前8帧应用惩罚
                 )
             } else {
                 talker_sampler.sample_with_allow(
-                    &self.talker_ctx, 
-                    sample_idx, 
-                    Some(0), 
-                    Some(2048), 
-                    Some(&allow_tokens)
+                    &self.talker_ctx,
+                    sample_idx,
+                    Some(0),
+                    Some(2048),
+                    Some(&allow_tokens),
                 )
             };
+            eprintln!("[Debug] Sampled code_0={}", code_0);
 
             if code_0 == 2150 || code_0 == 151673 {
                 println!("\n    EOS detected at step {} (code_0={})", step, code_0);
                 break;
             }
-            
-            // 连续静音检测：如果 code_0 为特定静音值，增加计数器
-            // 静音帧通常 code_0 在较低值范围（如 0-100）
-            // 逗号停顿约 3-4 帧，句号停顿约 7-8 帧，超过 8 帧后施加静音惩罚
+
             let is_silent_frame = code_0 < 100;
             if is_silent_frame {
                 consecutive_silent_frames += 1;
+                eprintln!(
+                    "[Debug] silent frame {}, code_0={}",
+                    consecutive_silent_frames, code_0
+                );
                 if consecutive_silent_frames >= MAX_SILENT_FRAMES {
-                    println!("\n    Early stop: {} consecutive silent frames detected", consecutive_silent_frames);
+                    eprintln!(
+                        "[Debug] Early stop: {} consecutive silent frames",
+                        consecutive_silent_frames
+                    );
+                    println!(
+                        "\n    Early stop: {} consecutive silent frames detected",
+                        consecutive_silent_frames
+                    );
                     break;
                 }
             } else {
                 consecutive_silent_frames = 0;
             }
-            
+
             all_codes.push(code_0);
 
             // Predictor
@@ -717,23 +723,22 @@ impl TtsEngine {
                 }
             }
 
-            // 每 12 帧发送一次
-            let current_frame = (all_codes.len() / 16) as usize;
-            
-            if current_frame >= SEND_INTERVAL && current_frame % SEND_INTERVAL == 0 {
-                // 只发送新的帧（从上次发送位置到现在）
-                let start_frame = current_frame - SEND_INTERVAL;
-                let end_frame = current_frame;
-                
-                // 提取 codes（每帧 16 个 codes）
+            // 流式发送
+            let current_frame = all_codes.len() / 16;
+
+            if current_frame > last_sent_frame + SEND_INTERVAL {
+                let start_frame = last_sent_frame;
+                let end_frame = last_sent_frame + SEND_INTERVAL;
+
                 let start_idx = start_frame * 16;
                 let end_idx = end_frame * 16;
                 let frame_codes: Vec<i64> = all_codes[start_idx..end_idx]
                     .iter()
                     .map(|&c| c as i64)
                     .collect();
-                
+
                 let _ = tx.send((frame_codes, false));
+                last_sent_frame += SEND_INTERVAL;
             }
 
             let mut feedback = vec![0.0f32; 2048];
@@ -743,15 +748,7 @@ impl TtsEngine {
                 }
             }
 
-            let text_vec = if let Some(ref pool) = trailing_text_pool {
-                if step < pool.len() {
-                    &pool[step]
-                } else {
-                    &tts_pad
-                }
-            } else {
-                &tts_pad
-            };
+            let text_vec = &tts_pad;
             for (i, val) in text_vec.iter().enumerate() {
                 if i < feedback.len() {
                     feedback[i] += val;
@@ -770,26 +767,21 @@ impl TtsEngine {
             cur_pos += 1;
         }
 
-        // 发送剩余的帧（包括正好整除的情况）
+        // 发送剩余的帧
         let total_frames = all_codes.len() / 16;
-        let last_sent_frame = (total_frames / SEND_INTERVAL) * SEND_INTERVAL;
-        
-        // 总是发送剩余的帧（如果有）
+
         if total_frames > last_sent_frame {
             let start_frame = last_sent_frame;
             let end_frame = total_frames;
-            
+
             let start_idx = start_frame * 16;
             let end_idx = end_frame * 16;
             let frame_codes: Vec<i64> = all_codes[start_idx..end_idx]
                 .iter()
                 .map(|&c| c as i64)
                 .collect();
-            
+
             let _ = tx.send((frame_codes, true));
-        } else if total_frames == last_sent_frame && total_frames > 0 {
-            // 正好整除的情况，发送空数组标记结束
-            let _ = tx.send((Vec::new(), true));
         } else {
             let _ = tx.send((Vec::new(), true));
         }

@@ -1,18 +1,20 @@
 use axum::{
-    extract::{DefaultBodyLimit, State, ws::{WebSocket, WebSocketUpgrade, Message}},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        DefaultBodyLimit, State,
+    },
+    http::header,
     response::{Html, IntoResponse},
-    Json, Router,
     routing::{get, post},
-    http::{header, StatusCode},
+    Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
 use qwen3_tts::{TtsEngine, VoiceFile};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Instant};
 use tokio::sync::Mutex;
 use tower_http::cors::{Any, CorsLayer};
-use futures_util::StreamExt;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -31,6 +33,9 @@ struct Args {
 
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
+
+    #[arg(long, default_value_t = 4)]
+    threads: i32,
 }
 
 struct AppState {
@@ -42,7 +47,6 @@ struct AppState {
 struct TTSRequest {
     text: String,
     speaker: Option<String>,
-    streaming: Option<bool>,
     temperature: Option<f32>,
     top_k: Option<i32>,
     top_p: Option<f32>,
@@ -73,6 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Model Dir: {:?}", args.model_dir);
     println!("Quant:     {}", args.quant);
     println!("Port:      {}", args.port);
+    println!("Threads:   {}", args.threads);
 
     println!("Checking models...");
     TtsEngine::download_models(&args.model_dir, &args.quant)
@@ -80,7 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Model download failed: {}", e))?;
 
     println!("Loading engine...");
-    let mut engine = TtsEngine::new(&args.model_dir, &args.quant)
+    let mut engine = TtsEngine::new(&args.model_dir, &args.quant, args.threads)
         .await
         .map_err(|e| format!("Engine load failed: {}", e))?;
 
@@ -91,10 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let speakers = engine.get_speakers_map().clone();
     let engine = Arc::new(Mutex::new(engine));
 
-    let state = AppState {
-        engine,
-        speakers,
-    };
+    let state = AppState { engine, speakers };
 
     let app = Router::new()
         .route("/", get(index))
@@ -141,9 +143,7 @@ async fn health() -> &'static str {
     "OK"
 }
 
-async fn speakers_handler(
-    State(state): State<Arc<AppState>>,
-) -> Json<SpeakersResponse> {
+async fn speakers_handler(State(state): State<Arc<AppState>>) -> Json<SpeakersResponse> {
     let names: Vec<String> = state.speakers.keys().cloned().collect();
     Json(SpeakersResponse { speakers: names })
 }
@@ -152,8 +152,8 @@ async fn tts_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TTSRequest>,
 ) -> Json<TTSResponse> {
+    let start = Instant::now();
     let speaker_name = req.speaker.unwrap_or_else(|| "vivian".to_string());
-    let streaming = req.streaming.unwrap_or(false);
 
     let voice = state.speakers.get(&speaker_name).cloned();
 
@@ -196,17 +196,21 @@ async fn tts_handler(
         engine.set_max_steps(max_steps);
     }
 
-    let result = engine.generate_with_voice_streaming(
-        &req.text,
-        &voice,
-        req.instruction.as_deref(),
-        streaming,
-        None,
-    );
+    let result =
+        engine.generate_with_voice_streaming(&req.text, &voice, req.instruction.as_deref(), None);
 
     match result {
         Ok(audio) => {
             let duration_ms = (audio.samples.len() as f64 / audio.sample_rate as f64) * 1000.0;
+            let audio_duration_secs = audio.samples.len() as f64 / audio.sample_rate as f64;
+            let rtf = start.elapsed().as_secs_f64() / audio_duration_secs;
+            println!(
+                "RTF: {:.3} (gen: {:.2}s, audio: {:.2}s)",
+                rtf,
+                start.elapsed().as_secs_f64(),
+                audio_duration_secs
+            );
+
             let wav_data = audio.to_wav_bytes();
 
             Json(TTSResponse {
@@ -236,69 +240,81 @@ async fn tts_stream_handler(
 }
 
 async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
-    // 文本段通道：前端 -> 生成线程
-    let (text_tx, text_rx) = std::sync::mpsc::channel::<(String, Option<String>)>();
-    // 音频通道：生成线程 -> 前端
-    let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
-    
-    // 克隆需要的变量
+    let (text_tx, text_rx) = std::sync::mpsc::channel::<(String, Option<String>, Option<String>)>();
+    let (audio_tx, mut audio_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<f32>>();
+
     let engine = state.engine.clone();
     let speakers = state.speakers.clone();
-    
-    // 启动生成线程
-    let generate_thread = std::thread::spawn(move || {
+
+    let mut total_samples: usize = 0;
+    let stream_start = std::time::Instant::now();
+
+    std::thread::spawn(move || {
         let mut engine = engine.blocking_lock();
         let mut voice: Option<VoiceFile> = None;
-        
-        while let Ok((text, speaker_name)) = text_rx.recv() {
-            // 检查是否结束
+
+        while let Ok((text, speaker_name, instruction)) = text_rx.recv() {
             if text.is_empty() {
                 break;
             }
-            
-            // 第一次时初始化 speaker
+
             if voice.is_none() {
                 let spk_name = speaker_name.unwrap_or_else(|| "vivian".to_string());
                 voice = speakers.get(&spk_name).cloned();
                 if voice.is_none() {
-                    let _ = audio_tx.send(vec![]); // 发送空表示错误
+                    let _ = audio_tx.send(vec![]);
                     break;
                 }
             }
-            
+
             let voice_ref = voice.as_ref().unwrap();
-            
-            // 生成音频
+
             let result = engine.generate_with_voice_streaming(
-                &text, 
-                voice_ref, 
-                None, 
-                true, 
-                Some(audio_tx.clone())
+                &text,
+                voice_ref,
+                instruction.as_deref(),
+                Some(audio_tx.clone()),
             );
-            
+
             if result.is_err() {
                 break;
             }
-            
-            // 发送段完成信号（通过空 vec）
+
             let _ = audio_tx.send(vec![]);
         }
-        // 线程结束，关闭 audio_tx
-        drop(audio_tx);
     });
-    
+
     let mut current_speaker: Option<String> = None;
     let mut end_requested = false;
-    
+
     loop {
-        // 先发送所有待处理的音频数据
-        loop {
-            match audio_rx.try_recv() {
-                Ok(samples) => {
+        if end_requested {
+            match audio_rx.recv().await {
+                Some(samples) => {
                     if samples.is_empty() {
                         let _ = socket.send(Message::Text("segment_done".to_string())).await;
                     } else {
+                        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+                        if socket.send(Message::Binary(bytes)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                None => break,
+            }
+        } else {
+            tokio::select! {
+                Some(samples) = audio_rx.recv() => {
+                    if samples.is_empty() {
+                        let gen_time = stream_start.elapsed().as_secs_f64();
+                        let audio_duration = total_samples as f64 / 24000.0;
+                        let rtf = if audio_duration > 0.0 { gen_time / audio_duration } else { 0.0 };
+                        eprintln!("[Stream] RTF: {:.3} (gen: {:.2}s, audio: {:.2}s)", rtf, gen_time, audio_duration);
+
+                        let _ = socket.send(Message::Text("segment_done".to_string())).await;
+                    } else {
+                        total_samples += samples.len();
+                        eprintln!("[Stream] received {} samples, total: {}", samples.len(), total_samples);
                         let bytes: Vec<u8> = samples
                             .iter()
                             .flat_map(|s| s.to_le_bytes())
@@ -308,73 +324,43 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
                         }
                     }
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    // 生成线程结束
-                    end_requested = true;
-                    break;
-                }
-            }
-        }
-        
-        // 如果生成线程结束，退出
-        if end_requested {
-            break;
-        }
-        
-        // 等待 WebSocket 消息（带超时，以便定期检查音频数据）
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            socket.recv()
-        ).await {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                // 检查是否是结束信号
-                if text == "end" {
-                    let _ = text_tx.send((String::new(), None));
-                    // 标记结束，但继续处理剩余音频
-                    end_requested = true;
-                    continue;
-                }
+                msg = socket.recv() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            if text == "end" {
+                                let _ = text_tx.send((String::new(), None, None));
+                                end_requested = true;
+                            } else {
+                                let req: TTSRequest = match serde_json::from_str(&text) {
+                                    Ok(r) => r,
+                                    Err(e) => {
+                                        let _ = socket.send(Message::Text(format!("{{\"error\": \"Invalid request: {}\"}}", e))).await;
+                                        continue;
+                                    }
+                                };
 
-                // 解析请求
-                let req: TTSRequest = match serde_json::from_str(&text) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let _ = socket.send(Message::Text(format!("{{\"error\": \"Invalid request: {}\"}}", e))).await;
-                        continue;
+                                if current_speaker.is_none() {
+                                    current_speaker = req.speaker.clone();
+                                }
+
+                                let text_to_generate = req.text.trim();
+                                if !text_to_generate.is_empty() {
+                                    let _ = text_tx.send((text_to_generate.to_string(), current_speaker.clone(), req.instruction.clone()));
+                                }
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(Message::Binary(_))) => continue,
+                        Some(Ok(Message::Ping(_))) => continue,
+                        Some(Ok(Message::Pong(_))) => continue,
+                        Some(Err(_)) => break,
+                        None => break,
                     }
-                };
-
-                // 记录 speaker（第一次有效）
-                if current_speaker.is_none() {
-                    current_speaker = req.speaker.clone();
                 }
-
-                let text_to_generate = req.text.trim();
-                if text_to_generate.is_empty() {
-                    continue;
-                }
-
-                // 发送文本到生成线程
-                let _ = text_tx.send((text_to_generate.to_string(), current_speaker.clone()));
-            }
-            Ok(Some(Ok(Message::Close(_)))) => break,
-            Ok(Some(Ok(Message::Binary(_)))) => continue,
-            Ok(Some(Ok(Message::Ping(_)))) => continue,
-            Ok(Some(Ok(Message::Pong(_)))) => continue,
-            Ok(Some(Err(_))) => break,
-            Ok(None) => break,
-            Err(_) => {
-                // 超时，继续循环检查音频数据
-                continue;
             }
         }
     }
 
-    // 清理
-    let _ = text_tx.send((String::new(), None));
-    let _ = generate_thread.join();
-    
-    // 发送结束标记
+    let _ = text_tx.send((String::new(), None, None));
     let _ = socket.send(Message::Text("done".to_string())).await;
 }

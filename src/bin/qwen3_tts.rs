@@ -72,9 +72,9 @@ struct Args {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Enable streaming mode for prompt building
-    #[arg(long, default_value_t = false)]
-    streaming: bool,
+    /// Number of threads for inference
+    #[arg(long, default_value_t = 4)]
+    threads: i32,
 }
 
 #[tokio::main]
@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Qwen3-TTS Example CLI ===");
     println!("Model Dir: {:?}", args.model_dir);
     println!("Quant:     {}", args.quant);
+    println!("Threads:   {}", args.threads);
     println!("Voice:     {:?}", args.voice_file);
     println!("Text:      {}", args.text);
 
@@ -95,7 +96,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("Model download failed: {}", e))?;
 
     // 1. Load Engine
-    let mut engine = TtsEngine::new(&args.model_dir, &args.quant)
+    let mut engine = TtsEngine::new(&args.model_dir, &args.quant, args.threads)
         .await
         .map_err(|e| format!("Engine load failed: {}", e))?;
     engine.set_max_steps(args.max_steps);
@@ -140,15 +141,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Generate
     let start_gen = Instant::now();
-    println!("Generating... (streaming={})", args.streaming);
+    println!("Generating...");
 
     // Generate
     let audio = engine
-        .generate_with_voice_streaming(&args.text, &voice, args.instruction.as_deref(), args.streaming, None)
+        .generate_with_voice_streaming(&args.text, &voice, args.instruction.as_deref(), None)
         .map_err(|e| format!("Generation failed: {}", e))?;
 
     let gen_duration = start_gen.elapsed();
     println!("Generation took: {:.2}s", gen_duration.as_secs_f32());
+
+    let audio_duration_secs = audio.samples.len() as f32 / audio.sample_rate as f32;
+    let rtf = gen_duration.as_secs_f32() / audio_duration_secs;
+    println!(
+        "Audio: {:.2}s ({} samples @ {} Hz), RTF: {:.3}",
+        audio_duration_secs,
+        audio.samples.len(),
+        audio.sample_rate,
+        rtf
+    );
 
     // 4. Save
     audio

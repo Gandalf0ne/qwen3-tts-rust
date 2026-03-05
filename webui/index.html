@@ -288,12 +288,6 @@
                     <input type="number" id="maxSteps" value="512" min="64" max="2048" step="64">
                     <div class="info-text">生成最大 token 数</div>
                 </div>
-                <div class="form-group">
-                    <div class="checkbox-group" style="margin-top: 24px;">
-                        <input type="checkbox" id="streaming">
-                        <label for="streaming" style="margin-bottom: 0;">启用流式模式 (ICL 克隆)</label>
-                    </div>
-                </div>
             </div>
         </div>
 
@@ -420,7 +414,6 @@
             const seed = document.getElementById('seed').value ? parseInt(document.getElementById('seed').value) : null;
             const maxSteps = parseInt(document.getElementById('maxSteps').value) || 512;
             const instruction = document.getElementById('instruction').value.trim() || null;
-            const streaming = document.getElementById('streaming').checked;
 
             setGenerating(true);
             showStatus('正在生成音频...', 'info');
@@ -437,7 +430,6 @@
                     body: JSON.stringify({
                         text,
                         speaker,
-                        streaming,
                         temperature,
                         top_k,
                         top_p,
@@ -509,7 +501,15 @@
 
                 // 监听 AudioWorklet 消息
                 audioWorkletNode.port.onmessage = (event) => {
-                    if (event.data.type === 'buffer_drained') {
+                    if (event.data.type === 'prebuffer_ready') {
+                        console.log(`Pre-buffer ready: ${event.data.available} samples (${(event.data.available / 24000).toFixed(2)}s)`);
+                        showStatus(`预缓存就绪，开始播放...`, 'info');
+                    } else if (event.data.type === 'buffer_status') {
+                        const bufferMs = (event.data.available / 24000 * 1000).toFixed(0);
+                        console.log(`Buffer: ${event.data.available} samples (${bufferMs}ms), playing: ${event.data.isPlaying}, draining: ${event.data.isDraining}, drainRequested: ${event.data.drainRequested}, received: ${event.data.totalReceived}, played: ${event.data.totalPlayed}`);
+                    } else if (event.data.type === 'drain_started') {
+                        console.log(`Drain started: available=${event.data.available}, received=${event.data.totalReceived}, played=${event.data.totalPlayed}`);
+                    } else if (event.data.type === 'buffer_drained') {
                         console.log(`Buffer drained: played ${event.data.played}, received ${event.data.received}`);
                         if (isStreaming) {
                             stopStreaming();
@@ -599,6 +599,7 @@
             }
             
             if (audioWorkletNode) {
+                audioWorkletNode.port.postMessage('reset');
                 audioWorkletNode.disconnect();
                 audioWorkletNode = null;
             }

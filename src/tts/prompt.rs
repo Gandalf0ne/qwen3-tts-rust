@@ -19,7 +19,6 @@ pub struct PromptData {
     pub embd: Vec<Vec<f32>>,
     pub text_ids: Vec<u32>,
     pub spk_emb: Vec<f32>,
-    pub trailing_text_embd: Option<Vec<Vec<f32>>>,
 }
 
 pub struct PromptBuilder;
@@ -35,7 +34,6 @@ impl PromptBuilder {
         spk_emb: &[f32],
         lang_id: usize,
         instruct: Option<&str>,
-        streaming: bool,
     ) -> PromptData {
         let tts_pad = &assets.tts_pad;
 
@@ -68,48 +66,20 @@ impl PromptBuilder {
         let t_len = text_pool.len();
         let a_len = audio_pool.len();
 
-        let (body, trailing) = if streaming {
-            if t_len > a_len {
-                let mut b = Vec::with_capacity(a_len);
-                for i in 0..a_len {
-                    let fused: Vec<f32> = text_pool[i]
-                        .iter()
-                        .zip(audio_pool[i].iter())
-                        .map(|(t, a)| t + a)
-                        .collect();
-                    b.push(fused);
-                }
-                (b, Some(text_pool[a_len..].to_vec()))
-            } else {
-                let mut b = Vec::with_capacity(a_len);
-                for i in 0..a_len {
-                    let text_vec = if i < t_len { &text_pool[i] } else { tts_pad };
-                    let fused: Vec<f32> = text_vec
-                        .iter()
-                        .zip(audio_pool[i].iter())
-                        .map(|(t, a)| t + a)
-                        .collect();
-                    b.push(fused);
-                }
-                (b, None)
-            }
-        } else {
-            let max_len = t_len.max(a_len);
-            let mut b = Vec::with_capacity(max_len);
-            for i in 0..max_len {
-                let text_vec = if i < t_len { &text_pool[i] } else { tts_pad };
-                let audio_vec = if i < a_len { &audio_pool[i] } else { tts_pad };
-                let fused: Vec<f32> = text_vec
-                    .iter()
-                    .zip(audio_vec.iter())
-                    .map(|(t, a)| t + a)
-                    .collect();
-                b.push(fused);
-            }
-            (b, None)
-        };
+        let max_len = t_len.max(a_len);
+        let mut body = Vec::with_capacity(max_len);
+        for i in 0..max_len {
+            let text_vec = if i < t_len { &text_pool[i] } else { tts_pad };
+            let audio_vec = if i < a_len { &audio_pool[i] } else { tts_pad };
+            let fused: Vec<f32> = text_vec
+                .iter()
+                .zip(audio_vec.iter())
+                .map(|(t, a)| t + a)
+                .collect();
+            body.push(fused);
+        }
 
-        Self::build_core_with_icl_body(
+        Self::build_core_with_clone_body(
             text,
             tokenizer,
             assets,
@@ -117,7 +87,6 @@ impl PromptBuilder {
             Some(spk_emb),
             instruct,
             body,
-            trailing,
         )
     }
 
@@ -141,8 +110,7 @@ impl PromptBuilder {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn build_core_with_icl_body(
+    fn build_core_with_clone_body(
         text: &str,
         tokenizer: &Tokenizer,
         assets: &Assets,
@@ -150,7 +118,6 @@ impl PromptBuilder {
         spk_emb: Option<&[f32]>,
         instruct: Option<&str>,
         body: Vec<Vec<f32>>,
-        trailing: Option<Vec<Vec<f32>>>,
     ) -> PromptData {
         let mut embeds = Vec::new();
 
@@ -219,7 +186,6 @@ impl PromptBuilder {
             embd: embeds,
             text_ids: text_ids.into_iter().collect(),
             spk_emb: result_spk_emb,
-            trailing_text_embd: trailing,
         }
     }
 
@@ -236,25 +202,71 @@ impl PromptBuilder {
     ) -> Result<PromptData, String> {
         let mut embeds = Vec::new();
         let text_ids = tokenizer.encode(text);
-        
+
         // Check if text_ids is empty (e.g., only punctuation)
         if text_ids.is_empty() {
             return Err("Text is empty or contains only unsupported characters".to_string());
         }
-        
+
         // Check if text contains only punctuation and whitespace
         let text_trimmed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
         let only_punctuation = text_trimmed.chars().all(|c| {
-            matches!(c, 
-                '，' | '。' | '、' | '；' | '：' | '？' | '！' | '"' | '"' | '\'' | '\'' | 
-                '（' | '）' | '【' | '】' | '《' | '》' | '…' | '—' | '～' |
-                ',' | '.' | '!' | '?' | ';' | ':' | '\'' | '"' | '(' | ')' | '[' | ']' |
-                '<' | '>' | '-' | '~' | '`' | '@' | '#' | '$' | '%' | '^' | '&' | '*' |
-                '+' | '=' | '|' | '\\' | '/' | '{' | '}' | '_'
+            matches!(
+                c,
+                '，' | '。'
+                    | '、'
+                    | '；'
+                    | '：'
+                    | '？'
+                    | '！'
+                    | '"'
+                    | '\''
+                    | '（'
+                    | '）'
+                    | '【'
+                    | '】'
+                    | '《'
+                    | '》'
+                    | '…'
+                    | '—'
+                    | '～'
+                    | ','
+                    | '.'
+                    | '!'
+                    | '?'
+                    | ';'
+                    | ':'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | '-'
+                    | '~'
+                    | '`'
+                    | '@'
+                    | '#'
+                    | '$'
+                    | '%'
+                    | '^'
+                    | '&'
+                    | '*'
+                    | '+'
+                    | '='
+                    | '|'
+                    | '\\'
+                    | '/'
+                    | '{'
+                    | '}'
+                    | '_'
             )
         });
         if only_punctuation && !text_trimmed.is_empty() {
-            return Err("Text contains only punctuation marks, which may cause generation issues".to_string());
+            return Err(
+                "Text contains only punctuation marks, which may cause generation issues"
+                    .to_string(),
+            );
         }
 
         let result_spk_emb = spk_emb
@@ -377,7 +389,6 @@ impl PromptBuilder {
             embd: embeds,
             text_ids: text_ids.into_iter().collect(),
             spk_emb: result_spk_emb,
-            trailing_text_embd: None,
         })
     }
 }
