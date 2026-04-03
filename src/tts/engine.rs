@@ -154,6 +154,25 @@ impl TtsEngine {
         }
     }
 
+    fn load_llama_models(
+        talker_path: &Path,
+        predictor_path: &Path,
+        n_gpu_layers: i32,
+    ) -> Result<(LlamaModel, LlamaModel), String> {
+        let talker_model = LlamaModel::load(talker_path, n_gpu_layers)
+            .map_err(|e| format!("Failed to load Talker: {}", e))?;
+
+        let predictor_model = match LlamaModel::load(predictor_path, n_gpu_layers) {
+            Ok(model) => model,
+            Err(e) => {
+                drop(talker_model);
+                return Err(format!("Failed to load Predictor: {}", e));
+            }
+        };
+
+        Ok((talker_model, predictor_model))
+    }
+
     /// Initialize the TTS Engine from the specified model directory.
     ///
     /// This function loads all necessary models (GGUF, Onnx, Tokenizer) from the given directory.
@@ -216,11 +235,36 @@ impl TtsEngine {
         let talker_path = model_dir.join(quant_dir).join("qwen3_tts_talker.gguf");
         let predictor_path = model_dir.join(quant_dir).join("qwen3_tts_predictor.gguf");
 
-        let talker_model = LlamaModel::load(&talker_path, n_gpu_layers)
-            .map_err(|e| format!("Failed to load Talker: {}", e))?;
+        let (talker_model, predictor_model, effective_gpu_layers) =
+            match Self::load_llama_models(&talker_path, &predictor_path, n_gpu_layers) {
+                Ok((talker_model, predictor_model)) => {
+                    (talker_model, predictor_model, n_gpu_layers)
+                }
+                Err(primary_error) if n_gpu_layers > 0 => {
+                    eprintln!(
+                        "GPU/Vulkan model initialization failed ({}). Retrying on CPU.",
+                        primary_error
+                    );
 
-        let predictor_model = LlamaModel::load(&predictor_path, n_gpu_layers)
-            .map_err(|e| format!("Failed to load Predictor: {}", e))?;
+                    let (talker_model, predictor_model) =
+                        Self::load_llama_models(&talker_path, &predictor_path, 0).map_err(
+                            |cpu_error| {
+                                format!(
+                                    "{}; CPU fallback also failed: {}",
+                                    primary_error, cpu_error
+                                )
+                            },
+                        )?;
+
+                    println!("GPU fallback active. Continuing with CPU layers.");
+                    (talker_model, predictor_model, 0)
+                }
+                Err(error) => return Err(error),
+            };
+
+        if effective_gpu_layers != n_gpu_layers {
+            println!("Effective GPU layers: {}", effective_gpu_layers);
+        }
 
         // 5. Create Contexts
         // talker: n_ctx=4096, n_batch=2048, embeddings=1, threads=-1 (auto)

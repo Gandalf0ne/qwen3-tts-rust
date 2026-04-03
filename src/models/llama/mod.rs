@@ -219,10 +219,25 @@ pub fn get_ffi() -> &'static LlamaFFI {
                     .unwrap_or(dummy_fn)
             };
 
-            let vulkan_path = runtime_path.join("ggml-vulkan.dll");
-            match libloading::Library::new(&vulkan_path) {
-                Ok(_) => println!("  [System] Verified: ggml-vulkan.dll is loadable."),
-                Err(e) => eprintln!("  [System] WARNING: ggml-vulkan.dll is NOT loadable: {}. This usually means missing Vulkan drivers or runtime.", e),
+            let vulkan_lib_name = if cfg!(target_os = "windows") {
+                Some("ggml-vulkan.dll")
+            } else if cfg!(target_os = "linux") {
+                Some("libggml-vulkan.so")
+            } else {
+                None
+            };
+
+            if let Some(vulkan_lib_name) = vulkan_lib_name {
+                let vulkan_path = runtime_path.join(vulkan_lib_name);
+                if vulkan_path.exists() {
+                    match libloading::Library::new(&vulkan_path) {
+                        Ok(_) => println!("  [System] Verified: {} is loadable.", vulkan_lib_name),
+                        Err(e) => eprintln!(
+                            "  [System] WARNING: {} is NOT loadable: {}. This usually means missing Vulkan drivers or runtime.",
+                            vulkan_lib_name, e
+                        ),
+                    }
+                }
             }
 
             let ffi = LlamaFFI {
