@@ -11,6 +11,68 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    fn has_linux_dri_device() -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+
+        std::fs::read_dir("/dev/dri")
+            .ok()
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.starts_with("renderD") || name.starts_with("card"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn runtime_backend_override() -> Option<String> {
+        std::env::var("QWEN3_TTS_RUNTIME_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn resolve_runtime_backend() -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(backend) = Self::runtime_backend_override() {
+            return match backend.as_str() {
+                "auto" => {
+                    if cfg!(feature = "cuda") {
+                        Ok("cuda".to_string())
+                    } else if cfg!(target_os = "macos") {
+                        Ok(String::new())
+                    } else {
+                        Ok("vulkan".to_string())
+                    }
+                }
+                "cpu" => Ok(String::new()),
+                "cuda" => Ok("cuda".to_string()),
+                "vulkan" => Ok("vulkan".to_string()),
+                "metal" if cfg!(target_os = "macos") => Ok(String::new()),
+                other => Err(format!(
+                    "Unsupported QWEN3_TTS_RUNTIME_BACKEND value: {} (expected auto, cpu, vulkan, cuda{})",
+                    other,
+                    if cfg!(target_os = "macos") { ", metal" } else { "" }
+                )
+                .into()),
+            };
+        }
+
+        if cfg!(feature = "cuda") {
+            Ok("cuda".to_string())
+        } else if cfg!(target_os = "macos") {
+            Ok(String::new())
+        } else if Self::has_linux_dri_device() {
+            Ok("vulkan".to_string())
+        } else {
+            Ok(String::new())
+        }
+    }
+
     fn is_runtime_library_path(path_str: &str) -> bool {
         path_str.ends_with(".dll")
             || path_str.ends_with(".so")
@@ -22,6 +84,56 @@ impl Downloader {
     fn path_contains_dir(path_str: &str, dir: &str) -> bool {
         let dir_marker = format!("/{}/", dir);
         path_str.contains(&dir_marker)
+    }
+
+    fn onnx_runtime_version_stamp(runtime_dir: &Path) -> std::path::PathBuf {
+        runtime_dir.join(".onnxruntime-version")
+    }
+
+    fn should_refresh_onnx_runtime(
+        runtime_dir: &Path,
+        dll_name: &str,
+        ort_version: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        if !runtime_dir.join(dll_name).exists() {
+            return Ok(true);
+        }
+
+        let stamp_path = Self::onnx_runtime_version_stamp(runtime_dir);
+        let recorded_version = std::fs::read_to_string(stamp_path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+
+        Ok(recorded_version != ort_version)
+    }
+
+    fn clear_existing_onnx_runtime(
+        runtime_dir: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !runtime_dir.exists() {
+            return Ok(());
+        }
+
+        for entry in std::fs::read_dir(runtime_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+
+            if !file_name.contains("onnxruntime") {
+                continue;
+            }
+
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn new() -> Self {
@@ -86,8 +198,8 @@ impl Downloader {
                 "tokenizer/tokenizer.json".to_owned(),
             ),
             (
-                format!("{}/qwen3_assets.gguf", quant_folder),
-                format!("{}/qwen3_assets.gguf", quant_folder),
+                "gguf/qwen3_assets.gguf".to_owned(),
+                "gguf/qwen3_assets.gguf".to_owned(),
             ),
             (
                 format!("{}/qwen3_tts_talker.gguf", quant_folder),
@@ -138,13 +250,19 @@ impl Downloader {
         };
 
         // Determine Backend
-        let backend = if cfg!(feature = "cuda") {
-            "cuda"
-        } else if cfg!(target_os = "macos") {
-            "" // macOS uses Metal integrated in the binary
-        } else {
-            "vulkan"
-        };
+        let backend = Self::resolve_runtime_backend()?;
+        println!(
+            "Downloading llama.cpp runtime backend: {}",
+            if backend.is_empty() {
+                if cfg!(target_os = "macos") {
+                    "metal/cpu"
+                } else {
+                    "cpu"
+                }
+            } else {
+                backend.as_str()
+            }
+        );
 
         // Platform mapping for llama.cpp release assets
         // Windows -> win, Linux -> ubuntu, macOS -> macos
@@ -163,7 +281,9 @@ impl Downloader {
         };
 
         // 1. ONNX Runtime
-        let ort_version = "1.23.2";
+        // ort v2.0.0-rc.12 requires ONNX Runtime >= 1.24.x. Keeping this in sync
+        // avoids a deadlock in the crate's older-version error path.
+        let ort_version = "1.24.1";
         let ort_ext = if os == "win" { "zip" } else { "tgz" };
         let ort_filename = format!("onnxruntime-{}-{}-{}.{}", os, arch, ort_version, ort_ext);
         let ort_dll_name = if os == "win" {
@@ -174,8 +294,17 @@ impl Downloader {
             "libonnxruntime.so"
         };
 
-        if !runtime_dir.join(ort_dll_name).exists() {
-            println!("Downloading ONNX Runtime ({}-{})...", os, arch);
+        if Self::should_refresh_onnx_runtime(runtime_dir, ort_dll_name, ort_version)? {
+            if runtime_dir.join(ort_dll_name).exists() {
+                println!(
+                    "Refreshing ONNX Runtime to {} ({}-{})...",
+                    ort_version, os, arch
+                );
+                Self::clear_existing_onnx_runtime(runtime_dir)?;
+            } else {
+                println!("Downloading ONNX Runtime ({}-{})...", os, arch);
+            }
+
             let ort_url = format!(
                 "https://github.com/microsoft/onnxruntime/releases/download/v{}/{}",
                 ort_version, ort_filename
@@ -200,6 +329,7 @@ impl Downloader {
                 )?;
             }
             let _ = std::fs::remove_file(tmp_zip);
+            std::fs::write(Self::onnx_runtime_version_stamp(runtime_dir), ort_version)?;
         }
 
         // 2. Llama.cpp / GGML (Official Release)
@@ -214,7 +344,15 @@ impl Downloader {
         if !runtime_dir.join(llama_dll).exists() {
             println!(
                 "Downloading Llama.cpp Runtimes (Official {} vB7885)...",
-                if backend.is_empty() { "Metal" } else { backend }
+                if backend.is_empty() {
+                    if cfg!(target_os = "macos") {
+                        "Metal"
+                    } else {
+                        "CPU"
+                    }
+                } else {
+                    backend.as_str()
+                }
             );
             // URL Patterns:
             // win: llama-b7885-bin-win-vulkan-x64.zip

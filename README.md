@@ -99,6 +99,18 @@ cargo run --bin qwen3_tts -- `
     --seed 42             # 随机种子 (可选)
 ```
 
+### 7. Docker 本地测试 (CPU 自动回退)
+仓库提供了单一 `Dockerfile` 和一个本地测试用的 Compose 文件：
+
+```bash
+docker compose -f docker-compose.local.yml up -d --build
+./scripts/smoke-test-local.sh http://localhost:3100
+```
+
+- 在 Linux 上如果容器内没有可用的 `/dev/dri` 设备，运行时会自动回退到 CPU。
+- 本地测试会复用 `./local-data/models` 和 `./local-data/runtime`，首次启动会下载较大的模型和运行时文件。
+- `smoke-test-local.sh` 会验证 `/health`、`/v1/models`、`/api/speakers`、`/v1/audio/speech` 和 `/api/tts`。
+
 ## 📦 作为 Rust 库使用
 
 在 `Cargo.toml` 中添加依赖：

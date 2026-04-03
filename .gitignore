@@ -15,6 +15,7 @@
 
 # Runtime binaries
 /runtime
+/local-data
 *.dll
 *.exe
 *.so

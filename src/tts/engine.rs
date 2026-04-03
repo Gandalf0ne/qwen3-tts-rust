@@ -110,6 +110,50 @@ pub struct TtsEngine {
 }
 
 impl TtsEngine {
+    fn has_linux_dri_device() -> bool {
+        if !cfg!(target_os = "linux") {
+            return false;
+        }
+
+        std::fs::read_dir("/dev/dri")
+            .ok()
+            .map(|entries| {
+                entries.filter_map(Result::ok).any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .map(|name| name.starts_with("renderD") || name.starts_with("card"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn runtime_backend_override() -> Option<String> {
+        std::env::var("QWEN3_TTS_RUNTIME_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty())
+    }
+
+    fn n_gpu_layers_from_env() -> i32 {
+        if let Ok(value) = std::env::var("QWEN3_TTS_N_GPU_LAYERS") {
+            if let Ok(parsed) = value.trim().parse::<i32>() {
+                return parsed;
+            }
+            eprintln!(
+                "Invalid QWEN3_TTS_N_GPU_LAYERS value '{}', falling back to automatic default",
+                value
+            );
+        }
+
+        match Self::runtime_backend_override().as_deref() {
+            Some("cpu") => 0,
+            None if cfg!(target_os = "linux") && !Self::has_linux_dri_device() => 0,
+            _ => 99,
+        }
+    }
+
     /// Initialize the TTS Engine from the specified model directory.
     ///
     /// This function loads all necessary models (GGUF, Onnx, Tokenizer) from the given directory.
@@ -127,6 +171,8 @@ impl TtsEngine {
     ) -> Result<Self, String> {
         let model_dir = model_dir.as_ref();
         println!("Loading TtsEngine from: {:?} (quant: {})", model_dir, quant);
+        let n_gpu_layers = Self::n_gpu_layers_from_env();
+        println!("GPU layers: {}", n_gpu_layers);
 
         // 0. Auto-download check (Models + Runtimes)
         Self::download_models(model_dir, quant).await?;
@@ -170,10 +216,10 @@ impl TtsEngine {
         let talker_path = model_dir.join(quant_dir).join("qwen3_tts_talker.gguf");
         let predictor_path = model_dir.join(quant_dir).join("qwen3_tts_predictor.gguf");
 
-        let talker_model = LlamaModel::load(&talker_path, 99)
+        let talker_model = LlamaModel::load(&talker_path, n_gpu_layers)
             .map_err(|e| format!("Failed to load Talker: {}", e))?;
 
-        let predictor_model = LlamaModel::load(&predictor_path, 99)
+        let predictor_model = LlamaModel::load(&predictor_path, n_gpu_layers)
             .map_err(|e| format!("Failed to load Predictor: {}", e))?;
 
         // 5. Create Contexts

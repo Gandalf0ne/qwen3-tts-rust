@@ -1,0 +1,26 @@
+services:
+  qwen3-tts-local:
+    container_name: qwen3-tts-local
+    build:
+      context: .
+    image: qwen3-tts-rust:local-cpu
+    # The image auto-falls back to CPU when no /dev/dri device is present.
+    # Uncomment these only if you want to force a backend manually.
+    # environment:
+    #   QWEN3_TTS_RUNTIME_BACKEND: cpu
+    #   QWEN3_TTS_N_GPU_LAYERS: "0"
+    ports:
+      - "3100:3000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+    volumes:
+      # First startup downloads several gigabytes of models and runtime assets.
+      - ./local-data/models:/app/models:rw
+      - ./local-data/runtime:/app/runtime:rw
+      # Uncomment if you want to override the bundled speaker profiles locally.
+      # - ./local-data/speakers:/app/speakers:rw
