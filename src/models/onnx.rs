@@ -3,12 +3,14 @@
 //! 执行提供者: DirectML (Windows GPU)
 
 use ndarray::{Array3, Array4};
-use ort::execution_providers::DirectMLExecutionProvider;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::session::Session;
 use ort::session::SessionInputValue;
 use ort::value::Tensor;
 use std::error::Error;
+
+#[cfg(windows)]
+use ort::execution_providers::DirectMLExecutionProvider;
 
 /// 创建 CPU Session (fallback)
 fn create_cpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
@@ -19,7 +21,7 @@ fn create_cpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
     let builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)?;
 
     let cpu = ort::execution_providers::CPUExecutionProvider::default().build();
-    let builder = builder.with_execution_providers([cpu])?;
+    let mut builder = builder.with_execution_providers([cpu])?;
     println!("  [ONNX] CPU Provider configured.");
 
     let session = builder.commit_from_file(model_path)?;

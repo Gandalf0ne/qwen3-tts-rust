@@ -2,7 +2,6 @@
 /target
 /debug
 /release
-Cargo.lock
 
 # Models and Large Assets
 /models

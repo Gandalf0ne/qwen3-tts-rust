@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         DefaultBodyLimit, State,
     },
-    http::header,
+    http::{header, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
@@ -69,6 +69,39 @@ struct SpeakersResponse {
     speakers: Vec<String>,
 }
 
+// OpenAI-compatible types for /v1/audio/speech
+#[derive(Debug, Deserialize)]
+struct OpenAISpeechRequest {
+    #[serde(default)]
+    #[allow(dead_code)]
+    model: Option<String>,
+    input: String,
+    voice: String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    response_format: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    speed: Option<f64>,
+    // OpenAI uses "instructions" (plural) for style/emotion guidance
+    #[serde(default)]
+    instructions: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIModel {
+    id: String,
+    object: String,
+    created: u64,
+    owned_by: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAIModelList {
+    object: String,
+    data: Vec<OpenAIModel>,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -105,6 +138,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/tts/stream", get(tts_stream_handler))
         .route("/api/speakers", get(speakers_handler))
         .route("/health", get(health))
+        // OpenAI-compatible endpoints
+        .route("/v1/audio/speech", post(openai_speech_handler))
+        .route("/v1/models", get(openai_models_handler))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -117,10 +153,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = format!("{}:{}", args.host, args.port).parse()?;
     println!("Server running at http://{}", addr);
     println!("API endpoints:");
-    println!("  POST /api/tts        - Generate TTS audio (non-streaming)");
-    println!("  GET  /api/tts/stream - WebSocket streaming TTS");
-    println!("  GET  /api/speakers   - List available speakers");
-    println!("  GET  /health         - Health check");
+    println!("  POST /api/tts          - Generate TTS audio (non-streaming)");
+    println!("  GET  /api/tts/stream   - WebSocket streaming TTS");
+    println!("  GET  /api/speakers     - List available speakers");
+    println!("  GET  /health           - Health check");
+    println!("  POST /v1/audio/speech  - OpenAI-compatible TTS endpoint");
+    println!("  GET  /v1/models        - OpenAI-compatible model list");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
@@ -229,6 +267,75 @@ async fn tts_handler(
             duration_ms: None,
         }),
     }
+}
+
+// OpenAI-compatible /v1/audio/speech handler
+async fn openai_speech_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OpenAISpeechRequest>,
+) -> impl IntoResponse {
+    let speaker_name = req.voice;
+
+    let voice = match state.speakers.get(&speaker_name) {
+        Some(v) => v.clone(),
+        None => {
+            let available: Vec<&String> = state.speakers.keys().collect();
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                serde_json::json!({
+                    "error": {
+                        "message": format!("Voice '{}' not found. Available: {:?}", speaker_name, available),
+                        "type": "invalid_request_error"
+                    }
+                })
+                .to_string()
+                .into_bytes(),
+            )
+                .into_response();
+        }
+    };
+
+    let mut engine = state.engine.lock().await;
+
+    match engine.generate_with_voice_streaming(&req.input, &voice, req.instructions.as_deref(), None)
+    {
+        Ok(audio) => {
+            let wav_data = audio.to_wav_bytes();
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "audio/wav")],
+                wav_data,
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({
+                "error": {
+                    "message": e,
+                    "type": "server_error"
+                }
+            })
+            .to_string()
+            .into_bytes(),
+        )
+            .into_response(),
+    }
+}
+
+// OpenAI-compatible /v1/models handler
+async fn openai_models_handler() -> Json<OpenAIModelList> {
+    Json(OpenAIModelList {
+        object: "list".to_string(),
+        data: vec![OpenAIModel {
+            id: "tts-1".to_string(),
+            object: "model".to_string(),
+            created: 1700000000,
+            owned_by: "qwen3-tts-rust".to_string(),
+        }],
+    })
 }
 
 // WebSocket 流式 TTS 处理器

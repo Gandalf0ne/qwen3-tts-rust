@@ -11,6 +11,19 @@ pub struct Downloader {
 }
 
 impl Downloader {
+    fn is_runtime_library_path(path_str: &str) -> bool {
+        path_str.ends_with(".dll")
+            || path_str.ends_with(".so")
+            || path_str.contains(".so.")
+            || path_str.ends_with(".dylib")
+            || path_str.contains(".dylib.")
+    }
+
+    fn path_contains_dir(path_str: &str, dir: &str) -> bool {
+        let dir_marker = format!("/{}/", dir);
+        path_str.contains(&dir_marker)
+    }
+
     pub async fn new() -> Self {
         let client = Client::new();
         // Check connectivity to huggingface.co for MODELS
@@ -287,11 +300,10 @@ impl Downloader {
             if !prefix.is_empty() && !path_str.starts_with(prefix) {
                 continue;
             }
-            if !lib_subdir.is_empty() && !path_str.contains(lib_subdir) {
-                // For ONNX, we only want the DLLs in the lib/ folder
-                if !path_str.ends_with(".dll")
-                    && !path_str.ends_with(".so")
-                    && !path_str.ends_with(".dylib")
+            if !lib_subdir.is_empty() {
+                // For ONNX, only extract runtime libraries from the lib/ directory.
+                if !Self::path_contains_dir(&path_str, lib_subdir)
+                    || !Self::is_runtime_library_path(&path_str)
                 {
                     continue;
                 }
@@ -315,7 +327,7 @@ impl Downloader {
         tar_path: &Path,
         dest: &Path,
         prefix: &str,
-        _lib_subdir: &str,
+        lib_subdir: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let tar_gz = File::open(tar_path)?;
         let tar = flate2::read::GzDecoder::new(tar_gz);
@@ -329,11 +341,11 @@ impl Downloader {
                 continue;
             }
 
-            // Simplified check for libraries
-            if path_str.ends_with(".so")
-                || path_str.ends_with(".dylib")
-                || path_str.ends_with(".dll")
-            {
+            if !lib_subdir.is_empty() && !Self::path_contains_dir(&path_str, lib_subdir) {
+                continue;
+            }
+
+            if Self::is_runtime_library_path(&path_str) {
                 let file_name = path.file_name().unwrap();
                 let dest_file = dest.join(file_name);
                 entry.unpack(dest_file)?;

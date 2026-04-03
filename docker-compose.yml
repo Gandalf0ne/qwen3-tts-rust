@@ -1,0 +1,27 @@
+services:
+  qwen3-tts:
+    container_name: qwen3-tts
+    image: ghcr.io/gandalf0ne/qwen3-tts-rust:latest
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+      - /dev/dri/card0:/dev/dri/card0
+    # Verify GIDs on your system: stat -c '%g' /dev/dri/renderD128 /dev/dri/card0
+    group_add:
+      - '107'
+      - '44'
+    ports:
+      - '3100:3000'
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+    volumes:
+      # Models: GGUF + ONNX files (~4-6 GB, downloaded on first run)
+      - /mnt/ssd_speicher/generic/qwen3-tts/models:/app/models:rw
+      # Runtime: llama.cpp + ONNX Runtime shared libs (~200 MB, downloaded on first run)
+      - /mnt/ssd_speicher/generic/qwen3-tts/runtime:/app/runtime:rw
+      # Speakers: voice profiles (optional override of built-in defaults)
+      # - /mnt/ssd_speicher/generic/qwen3-tts/speakers:/app/speakers:rw
