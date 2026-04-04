@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-type BurnBackend = burn_wgpu::Vulkan<f32, i64, u8>;
+type BurnBackend = burn_wgpu::Wgpu<f32, i64, u32>;
 type BurnDevice = burn_wgpu::WgpuDevice;
 type BurnModel = burn_decoder_generated::Model<BurnBackend>;
 
@@ -31,7 +31,10 @@ impl BurnAudioDecoder {
         let burnpack_path = ensure_decoder_burnpack(Path::new(model_path))?;
         let device = BurnDevice::default();
 
-        println!("  [Burn] AudioDecoder: Initializing Vulkan/WGPU backend");
+        println!(
+            "  [Burn] AudioDecoder: Initializing WGPU on Vulkan backend (device: {:?})",
+            device
+        );
         burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
 
         let burnpack_path = burnpack_path
