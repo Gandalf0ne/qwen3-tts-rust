@@ -65,7 +65,12 @@ impl BurnAudioDecoder {
             "  [Burn] AudioDecoder: Initializing WGPU on Vulkan backend (device: {:?})",
             device
         );
-        burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
+        let setup =
+            burn_wgpu::init_setup::<burn_wgpu::graphics::Vulkan>(&device, Default::default());
+        println!(
+            "  [Burn] AudioDecoder: Adapter {:?}",
+            setup.adapter.get_info()
+        );
 
         let burnpack_path = burnpack_path
             .to_str()

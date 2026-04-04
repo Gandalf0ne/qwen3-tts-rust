@@ -8,7 +8,9 @@ use crate::utils::voice_file::VoiceFile;
 use crate::AudioSample;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Sampler configuration for TTS generation
 #[derive(Debug, Clone)]
@@ -78,6 +80,262 @@ impl SamplerConfig {
         self.presence_penalty = presence_penalty;
         self.penalty_last_n = penalty_last_n;
         self
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AmdGpuMonitor {
+    label: String,
+    gpu_busy_path: PathBuf,
+    mem_busy_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct AmdGpuSnapshot {
+    gpu_busy_percent: u32,
+    mem_busy_percent: Option<u32>,
+}
+
+#[derive(Debug, Default)]
+struct DecodeProgressStats {
+    device_label: Option<String>,
+    gpu_busy_samples: usize,
+    gpu_busy_sum: u64,
+    gpu_busy_max: Option<u32>,
+    mem_busy_samples: usize,
+    mem_busy_sum: u64,
+    mem_busy_max: Option<u32>,
+}
+
+struct DecodeProgressLogger {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<DecodeProgressStats>>,
+}
+
+impl AmdGpuMonitor {
+    fn detect() -> Option<Self> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+
+        let drm_entries = std::fs::read_dir("/sys/class/drm").ok()?;
+
+        for entry in drm_entries.filter_map(Result::ok) {
+            let entry_name = entry.file_name();
+            let entry_name = entry_name.to_str()?;
+
+            if !entry_name.starts_with("card") || entry_name.contains('-') {
+                continue;
+            }
+
+            let device_dir = entry.path().join("device");
+            let vendor = std::fs::read_to_string(device_dir.join("vendor")).ok()?;
+            if vendor.trim() != "0x1002" {
+                continue;
+            }
+
+            let gpu_busy_path = device_dir.join("gpu_busy_percent");
+            if !gpu_busy_path.is_file() {
+                continue;
+            }
+
+            let mem_busy_candidate = device_dir.join("mem_busy_percent");
+            let label = std::fs::read_to_string(device_dir.join("uevent"))
+                .ok()
+                .and_then(|uevent| {
+                    uevent.lines().find_map(|line| {
+                        line.strip_prefix("PCI_SLOT_NAME=")
+                            .map(|value| format!("{} ({})", entry_name, value))
+                    })
+                })
+                .unwrap_or_else(|| entry_name.to_string());
+
+            return Some(Self {
+                label,
+                gpu_busy_path,
+                mem_busy_path: mem_busy_candidate.is_file().then_some(mem_busy_candidate),
+            });
+        }
+
+        None
+    }
+
+    fn read_snapshot(&self) -> Option<AmdGpuSnapshot> {
+        let gpu_busy_percent = Self::read_percent(&self.gpu_busy_path)?;
+        let mem_busy_percent = self
+            .mem_busy_path
+            .as_ref()
+            .and_then(|path| Self::read_percent(path));
+
+        Some(AmdGpuSnapshot {
+            gpu_busy_percent,
+            mem_busy_percent,
+        })
+    }
+
+    fn read_percent(path: &Path) -> Option<u32> {
+        std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok()
+    }
+}
+
+impl DecodeProgressStats {
+    fn from_monitor(monitor: &Option<AmdGpuMonitor>) -> Self {
+        Self {
+            device_label: monitor.as_ref().map(|monitor| monitor.label.clone()),
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, snapshot: &AmdGpuSnapshot) {
+        self.gpu_busy_samples += 1;
+        self.gpu_busy_sum += snapshot.gpu_busy_percent as u64;
+        self.gpu_busy_max = Some(
+            self.gpu_busy_max
+                .map(|current| current.max(snapshot.gpu_busy_percent))
+                .unwrap_or(snapshot.gpu_busy_percent),
+        );
+
+        if let Some(mem_busy_percent) = snapshot.mem_busy_percent {
+            self.mem_busy_samples += 1;
+            self.mem_busy_sum += mem_busy_percent as u64;
+            self.mem_busy_max = Some(
+                self.mem_busy_max
+                    .map(|current| current.max(mem_busy_percent))
+                    .unwrap_or(mem_busy_percent),
+            );
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        if self.device_label.is_none() {
+            self.device_label = other.device_label;
+        }
+
+        self.gpu_busy_samples += other.gpu_busy_samples;
+        self.gpu_busy_sum += other.gpu_busy_sum;
+        self.gpu_busy_max = match (self.gpu_busy_max, other.gpu_busy_max) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        };
+
+        self.mem_busy_samples += other.mem_busy_samples;
+        self.mem_busy_sum += other.mem_busy_sum;
+        self.mem_busy_max = match (self.mem_busy_max, other.mem_busy_max) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(left), None) => Some(left),
+            (None, Some(right)) => Some(right),
+            (None, None) => None,
+        };
+    }
+
+    fn gpu_busy_avg(&self) -> Option<f64> {
+        (self.gpu_busy_samples > 0)
+            .then(|| self.gpu_busy_sum as f64 / self.gpu_busy_samples as f64)
+    }
+
+    fn mem_busy_avg(&self) -> Option<f64> {
+        (self.mem_busy_samples > 0).then(|| self.mem_busy_sum as f64 / self.mem_busy_samples as f64)
+    }
+
+    fn summary_suffix(&self) -> String {
+        let mut parts = Vec::new();
+
+        if let Some(device_label) = &self.device_label {
+            parts.push(format!("gpu_device={}", device_label));
+        }
+
+        if let Some(gpu_busy_avg) = self.gpu_busy_avg() {
+            parts.push(format!("gpu_busy_avg={:.1}%", gpu_busy_avg));
+        }
+
+        if let Some(gpu_busy_max) = self.gpu_busy_max {
+            parts.push(format!("gpu_busy_max={}%", gpu_busy_max));
+        }
+
+        if let Some(mem_busy_avg) = self.mem_busy_avg() {
+            parts.push(format!("mem_busy_avg={:.1}%", mem_busy_avg));
+        }
+
+        if let Some(mem_busy_max) = self.mem_busy_max {
+            parts.push(format!("mem_busy_max={}%", mem_busy_max));
+        }
+
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", parts.join(" "))
+        }
+    }
+}
+
+impl DecodeProgressLogger {
+    fn spawn(
+        phase_label: String,
+        monitor: Option<AmdGpuMonitor>,
+    ) -> Self {
+        let interval_ms = std::env::var("QWEN3_TTS_DECODE_PROGRESS_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1000);
+
+        if interval_ms == 0 {
+            return Self {
+                stop: Arc::new(AtomicBool::new(true)),
+                handle: None,
+            };
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_worker = stop.clone();
+        let interval = Duration::from_millis(interval_ms);
+
+        let handle = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut stats = DecodeProgressStats::from_monitor(&monitor);
+
+            loop {
+                std::thread::sleep(interval);
+
+                if stop_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let elapsed = started.elapsed().as_secs_f64();
+                match monitor.as_ref().and_then(|monitor| monitor.read_snapshot()) {
+                    Some(snapshot) => {
+                        stats.record(&snapshot);
+                        match snapshot.mem_busy_percent {
+                            Some(mem_busy_percent) => println!(
+                                "{}: elapsed={:.2}s gpu_busy={}%% mem_busy={}%%",
+                                phase_label, elapsed, snapshot.gpu_busy_percent, mem_busy_percent
+                            ),
+                            None => println!(
+                                "{}: elapsed={:.2}s gpu_busy={}%%",
+                                phase_label, elapsed, snapshot.gpu_busy_percent
+                            ),
+                        }
+                    }
+                    None => println!("{}: elapsed={:.2}s", phase_label, elapsed),
+                }
+            }
+
+            stats
+        });
+
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> DecodeProgressStats {
+        self.stop.store(true, Ordering::Relaxed);
+        match self.handle.take() {
+            Some(handle) => handle.join().unwrap_or_default(),
+            None => DecodeProgressStats::default(),
+        }
     }
 }
 
@@ -656,6 +914,11 @@ impl TtsEngine {
         let streaming_decode_enabled = stream_tx.is_some();
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
         let decoder_arc = self.decoder.clone();
+        let decode_gpu_monitor = if streaming_decode_enabled {
+            None
+        } else {
+            AmdGpuMonitor::detect()
+        };
         let stream_decode_interval = std::env::var("QWEN3_TTS_STREAM_DECODE_FRAMES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
@@ -672,8 +935,11 @@ impl TtsEngine {
             active_decode_time: std::time::Duration,
             chunk_count: usize,
             frame_count: usize,
+            progress_stats: DecodeProgressStats,
         }
 
+        let streaming_decode_enabled_for_decoder = streaming_decode_enabled;
+        let decode_gpu_monitor_for_decoder = decode_gpu_monitor.clone();
         let decoder_handle = std::thread::spawn(move || {
             let mut full_audio = Vec::new();
             let mut state = {
@@ -683,6 +949,9 @@ impl TtsEngine {
             let mut active_decode_time = std::time::Duration::default();
             let mut chunk_count = 0usize;
             let mut frame_count = 0usize;
+            let mut progress_stats =
+                DecodeProgressStats::from_monitor(&decode_gpu_monitor_for_decoder);
+            let mut decode_job_index = 0usize;
 
             while let Ok((codes, is_final)) = rx.recv() {
                 let n_frames = codes.len() / 16;
@@ -705,17 +974,71 @@ impl TtsEngine {
 
                 let safe_codes: Vec<i64> = codes.iter().map(|&c| c.clamp(0, 2047)).collect();
 
+                decode_job_index += 1;
+
+                let progress_logger = if !streaming_decode_enabled_for_decoder {
+                    match decode_gpu_monitor_for_decoder.as_ref() {
+                        Some(monitor) => println!(
+                            "Post-EOS decode chunk {} started: frames={} final={} gpu_device={}",
+                            decode_job_index, n_frames, is_final, monitor.label
+                        ),
+                        None => println!(
+                            "Post-EOS decode chunk {} started: frames={} final={} gpu_telemetry=unavailable",
+                            decode_job_index, n_frames, is_final
+                        ),
+                    }
+
+                    Some(DecodeProgressLogger::spawn(
+                        format!("Post-EOS decode progress [chunk {}]", decode_job_index),
+                        decode_gpu_monitor_for_decoder.clone(),
+                    ))
+                } else {
+                    None
+                };
+
                 let chunk_started = std::time::Instant::now();
                 let mut local_decoder = decoder_arc.lock().unwrap();
-                if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final) {
-                    active_decode_time += chunk_started.elapsed();
-                    chunk_count += 1;
-                    frame_count += n_frames;
-                    if !samples.is_empty() {
-                        if let Some(ref stx) = stream_tx {
-                            let _ = stx.send(samples.clone());
+                let decode_result = local_decoder.decode(&safe_codes, &mut state, is_final);
+                drop(local_decoder);
+
+                let chunk_elapsed = chunk_started.elapsed();
+                active_decode_time += chunk_elapsed;
+
+                let chunk_progress_stats = progress_logger
+                    .map(|logger| logger.finish())
+                    .unwrap_or_default();
+                progress_stats.merge(chunk_progress_stats);
+
+                match decode_result {
+                    Ok(samples) => {
+                        chunk_count += 1;
+                        frame_count += n_frames;
+
+                        if !streaming_decode_enabled_for_decoder {
+                            println!(
+                                "Post-EOS decode chunk {} finished: elapsed={:.2}s frames={} samples={}{}",
+                                decode_job_index,
+                                chunk_elapsed.as_secs_f64(),
+                                n_frames,
+                                samples.len(),
+                                progress_stats.summary_suffix()
+                            );
                         }
-                        full_audio.extend(samples);
+
+                        if !samples.is_empty() {
+                            if let Some(ref stx) = stream_tx {
+                                let _ = stx.send(samples.clone());
+                            }
+                            full_audio.extend(samples);
+                        }
+                    }
+                    Err(error) => {
+                        println!(
+                            "Post-EOS decode chunk {} failed after {:.2}s: {}",
+                            decode_job_index,
+                            chunk_elapsed.as_secs_f64(),
+                            error
+                        );
                     }
                 }
             }
@@ -724,6 +1047,7 @@ impl TtsEngine {
                 active_decode_time,
                 chunk_count,
                 frame_count,
+                progress_stats,
             }
         });
 
@@ -930,6 +1254,18 @@ impl TtsEngine {
             if total_frames == 0 {
                 let _ = tx.send((Vec::new(), true));
             } else {
+                let total_chunks = total_frames.div_ceil(non_stream_decode_interval);
+                match decode_gpu_monitor.as_ref() {
+                    Some(monitor) => println!(
+                        "Post-EOS decode scheduled: total_frames={} chunk_frames={} chunks={} gpu_device={}",
+                        total_frames, non_stream_decode_interval, total_chunks, monitor.label
+                    ),
+                    None => println!(
+                        "Post-EOS decode scheduled: total_frames={} chunk_frames={} chunks={} gpu_telemetry=unavailable",
+                        total_frames, non_stream_decode_interval, total_chunks
+                    ),
+                }
+
                 let mut start_frame = 0;
                 while start_frame < total_frames {
                     let end_frame = (start_frame + non_stream_decode_interval).min(total_frames);
@@ -957,7 +1293,7 @@ impl TtsEngine {
 
         let total_elapsed = generation_elapsed + decoder_result.active_decode_time;
         println!(
-            "Timing: generation={:.2}s decode={:.2}s total={:.2}s decode_chunks={} decode_frames={} mode={}",
+            "Timing: generation={:.2}s decode={:.2}s total={:.2}s decode_chunks={} decode_frames={} mode={}{}",
             generation_elapsed.as_secs_f64(),
             decoder_result.active_decode_time.as_secs_f64(),
             total_elapsed.as_secs_f64(),
@@ -967,7 +1303,8 @@ impl TtsEngine {
                 "streaming"
             } else {
                 "non-streaming"
-            }
+            },
+            decoder_result.progress_stats.summary_suffix()
         );
 
         Ok(AudioSample {
