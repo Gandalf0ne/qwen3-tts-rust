@@ -21,6 +21,7 @@ WORKDIR /build
 # Copy manifests first for layer caching
 COPY Cargo.toml Cargo.lock* build.rs .cargo/ ./
 COPY src/ src/
+COPY scripts/ scripts/
 COPY webui/ webui/
 COPY speakers/ speakers/
 
