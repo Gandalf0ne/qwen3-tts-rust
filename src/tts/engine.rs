@@ -1051,11 +1051,10 @@ impl TtsEngine {
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|&value| value > 0)
             .unwrap_or(4);
-        let non_stream_decode_interval = std::env::var("QWEN3_TTS_NONSTREAM_DECODE_FRAMES")
+        let non_stream_decode_interval_override = std::env::var("QWEN3_TTS_NONSTREAM_DECODE_FRAMES")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(32);
+            .filter(|&value| value > 0);
 
         struct DecoderThreadResult {
             audio: Vec<f32>,
@@ -1374,6 +1373,8 @@ impl TtsEngine {
             if total_frames == 0 {
                 let _ = tx.send((Vec::new(), true));
             } else {
+                let non_stream_decode_interval = non_stream_decode_interval_override
+                    .unwrap_or(total_frames);
                 let total_chunks = total_frames.div_ceil(non_stream_decode_interval);
                 match decode_gpu_monitor.as_ref() {
                     Some(monitor) => println!(
