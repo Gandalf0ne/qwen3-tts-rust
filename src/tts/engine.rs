@@ -9,7 +9,7 @@ use crate::AudioSample;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Sampler configuration for TTS generation
@@ -110,6 +110,97 @@ struct DecodeProgressStats {
 struct DecodeProgressLogger {
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<DecodeProgressStats>>,
+}
+
+enum DecoderCommand {
+    Reset {
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    Decode {
+        codes: Vec<i64>,
+        is_final: bool,
+        reply: std::sync::mpsc::Sender<Result<Vec<f32>, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct DecoderClient {
+    tx: std::sync::mpsc::Sender<DecoderCommand>,
+}
+
+impl DecoderClient {
+    fn start(model_path: String) -> Result<Self, String> {
+        let (tx, rx) = std::sync::mpsc::channel::<DecoderCommand>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+        std::thread::spawn(move || {
+            let mut decoder = match AudioDecoder::load(&model_path) {
+                Ok(decoder) => decoder,
+                Err(error) => {
+                    let _ = ready_tx.send(Err(format!(
+                        "Failed to load AudioDecoder: {}",
+                        error
+                    )));
+                    return;
+                }
+            };
+            let mut state = decoder.create_state();
+            let _ = ready_tx.send(Ok(()));
+
+            while let Ok(command) = rx.recv() {
+                match command {
+                    DecoderCommand::Reset { reply } => {
+                        state = decoder.create_state();
+                        let _ = reply.send(Ok(()));
+                    }
+                    DecoderCommand::Decode {
+                        codes,
+                        is_final,
+                        reply,
+                    } => {
+                        let result = decoder
+                            .decode(&codes, &mut state, is_final)
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+
+                        if is_final {
+                            state = decoder.create_state();
+                        }
+                    }
+                }
+            }
+        });
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self { tx }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("AudioDecoder worker exited during startup".to_string()),
+        }
+    }
+
+    fn reset(&self) -> Result<(), String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(DecoderCommand::Reset { reply: reply_tx })
+            .map_err(|_| "AudioDecoder worker channel closed".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "AudioDecoder worker did not respond to reset".to_string())?
+    }
+
+    fn decode(&self, codes: &[i64], is_final: bool) -> Result<Vec<f32>, String> {
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(DecoderCommand::Decode {
+                codes: codes.to_vec(),
+                is_final,
+                reply: reply_tx,
+            })
+            .map_err(|_| "AudioDecoder worker channel closed".to_string())?;
+        reply_rx
+            .recv()
+            .map_err(|_| "AudioDecoder worker did not respond to decode".to_string())?
+    }
 }
 
 impl AmdGpuMonitor {
@@ -351,7 +442,7 @@ pub struct TtsEngine {
     // ONNX Models
     encoder: Option<AudioEncoder>,
     speaker_encoder: Option<SpeakerEncoder>,
-    decoder: Arc<Mutex<AudioDecoder>>,
+    decoder: DecoderClient,
     // Llama: Contexts MUST be listed before models for correct drop order
     talker_ctx: LlamaContext,
     predictor_ctx: LlamaContext,
@@ -547,10 +638,13 @@ impl TtsEngine {
 
         // 6. 预加载 decoder（预热）
         println!("Pre-loading AudioDecoder...");
-        let decoder =
-            AudioDecoder::load(&onnx_dir.join("qwen3_tts_decoder.onnx").to_string_lossy())
-                .map_err(|e| format!("Failed to load AudioDecoder: {}", e))?;
-        let decoder = Arc::new(Mutex::new(decoder));
+        let decoder = DecoderClient::start(
+            onnx_dir
+                .join("qwen3_tts_decoder.onnx")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .map_err(|e| format!("Failed to load AudioDecoder: {}", e))?;
         println!("AudioDecoder pre-loaded and warmed up.");
 
         println!("TtsEngine loaded successfully.");
@@ -875,6 +969,7 @@ impl TtsEngine {
         stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<f32>>>,
     ) -> Result<AudioSample, String> {
         let generation_started = std::time::Instant::now();
+        self.decoder.reset()?;
         self.talker_ctx.clear_kv_cache();
         self.predictor_ctx.clear_kv_cache();
 
@@ -913,7 +1008,7 @@ impl TtsEngine {
 
         let streaming_decode_enabled = stream_tx.is_some();
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
-        let decoder_arc = self.decoder.clone();
+        let decoder_client = self.decoder.clone();
         let decode_gpu_monitor = if streaming_decode_enabled {
             None
         } else {
@@ -942,10 +1037,6 @@ impl TtsEngine {
         let decode_gpu_monitor_for_decoder = decode_gpu_monitor.clone();
         let decoder_handle = std::thread::spawn(move || {
             let mut full_audio = Vec::new();
-            let mut state = {
-                let local_decoder = decoder_arc.lock().unwrap();
-                local_decoder.create_state()
-            };
             let mut active_decode_time = std::time::Duration::default();
             let mut chunk_count = 0usize;
             let mut frame_count = 0usize;
@@ -958,8 +1049,7 @@ impl TtsEngine {
 
                 if n_frames == 0 {
                     if is_final {
-                        let mut local_decoder = decoder_arc.lock().unwrap();
-                        if let Ok(samples) = local_decoder.decode(&[], &mut state, true) {
+                        if let Ok(samples) = decoder_client.decode(&[], true) {
                             if !samples.is_empty() {
                                 if let Some(ref stx) = stream_tx {
                                     let _ = stx.send(samples.clone());
@@ -997,9 +1087,7 @@ impl TtsEngine {
                 };
 
                 let chunk_started = std::time::Instant::now();
-                let mut local_decoder = decoder_arc.lock().unwrap();
-                let decode_result = local_decoder.decode(&safe_codes, &mut state, is_final);
-                drop(local_decoder);
+                let decode_result = decoder_client.decode(&safe_codes, is_final);
 
                 let chunk_elapsed = chunk_started.elapsed();
                 active_decode_time += chunk_elapsed;
