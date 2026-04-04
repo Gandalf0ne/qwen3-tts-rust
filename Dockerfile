@@ -51,7 +51,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
-ENV LD_LIBRARY_PATH=/app
+ENV LD_LIBRARY_PATH=/app:/app/runtime
 
 # Working directory — critical: the app resolves "runtime/" and "models/"
 # relative to CWD via hardcoded paths in the source code
