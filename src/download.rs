@@ -144,6 +144,14 @@ impl Downloader {
                 "onnx/qwen3_tts_decoder.onnx".to_owned(),
             ),
             (
+                "onnx/qwen3_tts_codec_encoder.onnx".to_owned(),
+                "onnx/qwen3_tts_codec_encoder.onnx".to_owned(),
+            ),
+            (
+                "onnx/qwen3_tts_speaker_encoder.onnx".to_owned(),
+                "onnx/qwen3_tts_speaker_encoder.onnx".to_owned(),
+            ),
+            (
                 "tokenizer/tokenizer.json".to_owned(),
                 "tokenizer/tokenizer.json".to_owned(),
             ),

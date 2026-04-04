@@ -50,7 +50,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 ENV LD_LIBRARY_PATH=/app:/app/runtime
 
 # Working directory — critical: the app resolves "runtime/" and "models/"
