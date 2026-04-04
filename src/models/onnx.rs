@@ -562,134 +562,19 @@ impl CodecEmbeddings {
 }
 
 pub fn init_onruntime() -> Result<(), Box<dyn std::error::Error>> {
-    use std::path::PathBuf;
+    // Without `load-dynamic`, the ORT library (with WebGPU EP support) is
+    // statically linked at compile time by ort-sys. We just need to
+    // initialize the environment.
+    println!("  [ONNX] Initializing ONNX Runtime (statically linked, WebGPU-enabled)...");
 
-    // Check if the user has explicitly set ORT_DYLIB_PATH (e.g. custom build)
-    if let Ok(custom_path) = std::env::var("ORT_DYLIB_PATH") {
-        println!("  [ONNX] Using custom ORT_DYLIB_PATH: {}", custom_path);
-        let env_builder = ort::init_from(custom_path)
-            .map_err(|e| format!("Failed to load ONNX Runtime from ORT_DYLIB_PATH: {}", e))?;
-        let committed = env_builder.with_name("Qwen3TTS").commit();
-        if !committed {
-            return Err("Failed to commit ONNX Runtime environment".into());
-        }
-        println!("  [ONNX] ONNX Runtime initialized from custom path.");
-        return Ok(());
+    let committed = ort::init()
+        .with_name("Qwen3TTS")
+        .commit();
+
+    if !committed {
+        return Err("Failed to commit ONNX Runtime environment".into());
     }
 
-    // Default path: let the ort crate manage the binary.
-    // When built with `load-dynamic` + `webgpu`, ort-sys downloads the
-    // WebGPU-enabled binary at compile time and knows where it is.
-    //
-    // Strategy: prefer the ort-managed binary (with WebGPU support).
-    // Fall back to the runtime/ directory binary (CPU-only) if the
-    // ort-managed one isn't found.
-
-    let (dll_name, _providers_dll_name) = if cfg!(windows) {
-        ("onnxruntime.dll", "onnxruntime_providers_shared.dll")
-    } else if cfg!(target_os = "macos") {
-        (
-            "libonnxruntime.dylib",
-            "libonnxruntime_providers_shared.dylib",
-        )
-    } else {
-        ("libonnxruntime.so", "libonnxruntime_providers_shared.so")
-    };
-
-    // Try to find the ort-managed WebGPU binary in the cache
-    let ort_cache_binary = find_ort_cache_binary(dll_name);
-
-    if let Some(cache_path) = ort_cache_binary {
-        println!(
-            "  [ONNX] Loading WebGPU-enabled ONNX Runtime from ort cache: {}",
-            cache_path.display()
-        );
-        let env_builder = ort::init_from(&cache_path)
-            .map_err(|e| format!("Failed to load ONNX Runtime from cache: {}", e))?;
-        let committed = env_builder.with_name("Qwen3TTS").commit();
-        if !committed {
-            return Err("Failed to commit ONNX Runtime environment".into());
-        }
-        println!("  [ONNX] ONNX Runtime initialized (WebGPU-enabled) from ort cache.");
-        return Ok(());
-    }
-
-    // Fallback: try the runtime/ directory (CPU-only, legacy path)
-    let runtime_dir = PathBuf::from("runtime");
-    let dll_path = runtime_dir.join(dll_name);
-
-    if dll_path.exists() {
-        println!(
-            "  [ONNX] WARNING: Loading CPU-only ONNX Runtime from runtime/ directory: {}",
-            dll_path.display()
-        );
-        println!("  [ONNX] GPU acceleration will NOT be available for ONNX models.");
-        println!("  [ONNX] To fix: rebuild with `cargo build --release` to populate ort cache,");
-        println!("  [ONNX]   or set ORT_DYLIB_PATH to a WebGPU-enabled libonnxruntime.so.");
-        let env_builder = ort::init_from(&dll_path)
-            .map_err(|e| format!("Failed to load ONNX Runtime DLL: {}", e))?;
-        let committed = env_builder.with_name("Qwen3TTS").commit();
-        if !committed {
-            return Err("Failed to commit ONNX Runtime environment".into());
-        }
-        println!("  [ONNX] ONNX Runtime initialized (CPU-only fallback).");
-        return Ok(());
-    }
-
-    Err("ONNX Runtime not found. Rebuild the project or set ORT_DYLIB_PATH.".into())
-}
-
-/// Search the ort cache directory for the prebuilt ORT binary.
-/// The ort-sys build script stores binaries under ~/.cache/ort/ (Linux/macOS)
-/// or %LOCALAPPDATA%/ort/ (Windows).
-fn find_ort_cache_binary(dll_name: &str) -> Option<std::path::PathBuf> {
-    let cache_base = if cfg!(windows) {
-        std::env::var("LOCALAPPDATA")
-            .ok()
-            .map(|p| std::path::PathBuf::from(p).join("ort"))
-    } else {
-        dirs_or_home_cache().map(|p| p.join("ort"))
-    };
-
-    let cache_base = cache_base?;
-
-    if !cache_base.exists() {
-        return None;
-    }
-
-    // Walk the cache directory looking for the dll
-    find_file_recursive(&cache_base, dll_name, 5)
-}
-
-/// Get ~/.cache or $XDG_CACHE_HOME
-fn dirs_or_home_cache() -> Option<std::path::PathBuf> {
-    std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| std::path::PathBuf::from(h).join(".cache"))
-        })
-}
-
-/// Recursively find a file by name, limited by depth
-fn find_file_recursive(dir: &std::path::Path, target: &str, max_depth: u32) -> Option<std::path::PathBuf> {
-    if max_depth == 0 {
-        return None;
-    }
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if path.is_file() && path.file_name().map(|n| n == target).unwrap_or(false) {
-                return Some(path);
-            }
-            if path.is_dir() {
-                if let Some(found) = find_file_recursive(&path, target, max_depth - 1) {
-                    return Some(found);
-                }
-            }
-        }
-    }
-    None
+    println!("  [ONNX] ONNX Runtime initialized successfully.");
+    Ok(())
 }
