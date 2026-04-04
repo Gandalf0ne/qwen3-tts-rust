@@ -136,6 +136,10 @@ impl TtsEngine {
             .filter(|value| !value.is_empty())
     }
 
+    fn allow_llama_cpu_fallback() -> bool {
+        std::env::var("QWEN3_TTS_LLAMA_CPU_FALLBACK").unwrap_or_default() == "1"
+    }
+
     fn n_gpu_layers_from_env() -> i32 {
         if let Ok(value) = std::env::var("QWEN3_TTS_N_GPU_LAYERS") {
             if let Ok(parsed) = value.trim().parse::<i32>() {
@@ -217,19 +221,27 @@ impl TtsEngine {
 
         // 4. ONNX Models (Optional for preset mode, but good to have)
         let onnx_dir = model_dir.join("onnx");
-        let encoder = AudioEncoder::load(
-            &onnx_dir
-                .join("qwen3_tts_codec_encoder.onnx")
-                .to_string_lossy(),
-        )
-        .ok();
+        let encoder_path = onnx_dir.join("qwen3_tts_codec_encoder.onnx");
+        let encoder = match AudioEncoder::load(&encoder_path.to_string_lossy()) {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                eprintln!("Failed to load AudioEncoder ({}): {}", encoder_path.display(), error);
+                None
+            }
+        };
 
-        let speaker_encoder = SpeakerEncoder::load(
-            &onnx_dir
-                .join("qwen3_tts_speaker_encoder.onnx")
-                .to_string_lossy(),
-        )
-        .ok();
+        let speaker_encoder_path = onnx_dir.join("qwen3_tts_speaker_encoder.onnx");
+        let speaker_encoder = match SpeakerEncoder::load(&speaker_encoder_path.to_string_lossy()) {
+            Ok(encoder) => Some(encoder),
+            Err(error) => {
+                eprintln!(
+                    "Failed to load SpeakerEncoder ({}): {}",
+                    speaker_encoder_path.display(),
+                    error
+                );
+                None
+            }
+        };
 
         // 5. Load GGUF Models
         let talker_path = model_dir.join(quant_dir).join("qwen3_tts_talker.gguf");
@@ -240,9 +252,9 @@ impl TtsEngine {
                 Ok((talker_model, predictor_model)) => {
                     (talker_model, predictor_model, n_gpu_layers)
                 }
-                Err(primary_error) if n_gpu_layers > 0 => {
+                Err(primary_error) if n_gpu_layers > 0 && Self::allow_llama_cpu_fallback() => {
                     eprintln!(
-                        "GPU/Vulkan model initialization failed ({}). Retrying on CPU.",
+                        "GPU/Vulkan model initialization failed ({}). Retrying on CPU because QWEN3_TTS_LLAMA_CPU_FALLBACK=1.",
                         primary_error
                     );
 

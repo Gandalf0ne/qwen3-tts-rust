@@ -47,8 +47,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl3t64 \
     libasound2t64 \
     libgomp1 \
+    libstdc++6 \
     curl \
     libxext6 \
+    python3 \
+    python3-onnx \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LD_LIBRARY_PATH=/app:/app/runtime

@@ -20,8 +20,9 @@ services:
     environment:
       - QWEN3_TTS_RUNTIME_BACKEND=vulkan
       - QWEN3_TTS_N_GPU_LAYERS=99
-      # ONNX uses WebGPU (Dawn/Vulkan) by default.
-      # Set QWEN3_TTS_ONNX_CPU=1 to force CPU fallback if needed.
+      # Linux decoder defaults to Burn/WGPU Vulkan.
+      # The encoder and speaker ONNX models use WebGPU (Dawn/Vulkan) by default.
+      # Set QWEN3_TTS_ONNX_CPU=1 only if you explicitly want CPU for those ONNX models.
       # - QWEN3_TTS_ONNX_CPU=1
     volumes:
       - ./local-data/models:/app/models:rw

@@ -99,7 +99,7 @@ cargo run --bin qwen3_tts -- `
     --seed 42             # 随机种子 (可选)
 ```
 
-### 7. Docker 本地测试 (CPU 自动回退)
+### 7. Docker 本地测试
 仓库提供了单一 `Dockerfile` 和一个本地测试用的 Compose 文件：
 
 ```bash
@@ -107,7 +107,8 @@ docker compose -f docker-compose.local.yml up -d --build
 ./scripts/smoke-test-local.sh http://localhost:3100
 ```
 
-- 在 Linux 上如果容器内没有可用的 `/dev/dri` 设备，运行时会自动回退到 CPU。
+- 在 Linux 上默认要求可用的 `/dev/dri` Vulkan 设备。
+- 如果你明确要在 CPU 上运行 ONNX，请设置 `QWEN3_TTS_ONNX_CPU=1`。
 - 本地测试会复用 `./local-data/models` 和 `./local-data/runtime`，首次启动会下载较大的模型和运行时文件。
 - `smoke-test-local.sh` 会验证 `/health`、`/v1/models`、`/api/speakers`、`/v1/audio/speech` 和 `/api/tts`。
 

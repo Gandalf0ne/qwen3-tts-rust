@@ -9,6 +9,9 @@ use ort::session::SessionInputValue;
 use ort::value::Tensor;
 use std::error::Error;
 
+#[cfg(not(any(windows, target_os = "macos")))]
+use crate::models::burn_decoder::BurnAudioDecoder;
+
 #[cfg(windows)]
 use ort::execution_providers::DirectMLExecutionProvider;
 
@@ -58,7 +61,7 @@ fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
 }
 
 /// 创建 GPU Session (Linux — defaults to WebGPU/Dawn via Vulkan)
-/// Falls back to CPU if WebGPU init fails or QWEN3_TTS_ONNX_CPU=1 is set.
+/// CPU is only used when explicitly requested with QWEN3_TTS_ONNX_CPU=1.
 #[cfg(not(any(windows, target_os = "macos")))]
 fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
     if std::env::var("QWEN3_TTS_ONNX_CPU").unwrap_or_default() == "1" {
@@ -86,16 +89,18 @@ fn create_webgpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
                     println!("  [ONNX] WebGPU Session committed successfully.");
                     Ok(session)
                 }
-                Err(e) => {
-                    println!("  [ONNX] WebGPU session commit failed: {:?}, falling back to CPU.", e);
-                    create_cpu_session(model_path)
-                }
+                Err(e) => Err(format!(
+                    "WebGPU session commit failed for {}: {:?}. Set QWEN3_TTS_ONNX_CPU=1 only if you intentionally want CPU.",
+                    model_path, e
+                )
+                .into()),
             }
         }
-        Err(e) => {
-            println!("  [ONNX] WebGPU EP registration failed: {:?}, falling back to CPU.", e);
-            create_cpu_session(model_path)
-        }
+        Err(e) => Err(format!(
+            "WebGPU EP registration failed for {}: {:?}. Set QWEN3_TTS_ONNX_CPU=1 only if you intentionally want CPU.",
+            model_path, e
+        )
+        .into()),
     }
 }
 
@@ -374,28 +379,74 @@ impl SpeakerEncoder {
     }
 }
 
+#[cfg(not(any(windows, target_os = "macos")))]
+enum AudioDecoderBackend {
+    Burn(BurnAudioDecoder),
+    Onnx(Session),
+}
+
 /// 音频解码器 - 将 codec codes 解码为音频波形
 pub struct AudioDecoder {
+    #[cfg(any(windows, target_os = "macos"))]
     session: Session,
+    #[cfg(not(any(windows, target_os = "macos")))]
+    backend: AudioDecoderBackend,
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn decoder_backend_override() -> Result<String, Box<dyn Error>> {
+    let backend = std::env::var("QWEN3_TTS_DECODER_BACKEND")
+        .unwrap_or_else(|_| "burn-vulkan".to_string())
+        .trim()
+        .to_ascii_lowercase();
+
+    match backend.as_str() {
+        "burn" | "burn-vulkan" | "vulkan" => Ok("burn-vulkan".to_string()),
+        "onnx" => Ok("onnx".to_string()),
+        other => Err(format!(
+            "Unsupported QWEN3_TTS_DECODER_BACKEND value: {} (expected burn-vulkan or onnx)",
+            other
+        )
+        .into()),
+    }
 }
 
 impl AudioDecoder {
     pub fn load(model_path: &str) -> Result<Self, Box<dyn Error>> {
         println!("  [ONNX] AudioDecoder: Loading {}", model_path);
 
-        // Windows uses DirectML, Linux uses WebGPU/Vulkan, macOS uses CPU
         #[cfg(windows)]
-        let session = create_gpu_session(model_path)?;
-
-        #[cfg(not(any(windows, target_os = "macos")))]
-        let session = create_gpu_session(model_path)?;
+        {
+            let session = create_gpu_session(model_path)?;
+            print_session_info(&session, "AudioDecoder");
+            return Ok(AudioDecoder { session });
+        }
 
         #[cfg(target_os = "macos")]
-        let session = create_cpu_session(model_path)?;
+        {
+            let session = create_cpu_session(model_path)?;
+            print_session_info(&session, "AudioDecoder");
+            return Ok(AudioDecoder { session });
+        }
 
-        print_session_info(&session, "AudioDecoder");
-
-        Ok(AudioDecoder { session })
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            match decoder_backend_override()?.as_str() {
+                "onnx" => {
+                    let session = create_gpu_session(model_path)?;
+                    print_session_info(&session, "AudioDecoder (ONNX)");
+                    Ok(AudioDecoder {
+                        backend: AudioDecoderBackend::Onnx(session),
+                    })
+                }
+                _ => {
+                    let burn_decoder = BurnAudioDecoder::load(model_path)?;
+                    Ok(AudioDecoder {
+                        backend: AudioDecoderBackend::Burn(burn_decoder),
+                    })
+                }
+            }
+        }
     }
 
     pub fn create_state() -> DecoderState {
@@ -408,116 +459,115 @@ impl AudioDecoder {
         state: &mut DecoderState,
         is_final: bool,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
-        let n_frames = codes.len() / 16;
-
-        // 如果没有帧且不是 is_final，直接返回空
-        if n_frames == 0 && !is_final {
-            return Ok(vec![]);
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            decode_onnx_session(&mut self.session, codes, state, is_final)
         }
 
-        // 1. Prepare Inputs
-        let mut inputs_vec: Vec<(std::borrow::Cow<'_, str>, SessionInputValue<'_>)> = Vec::new();
-
-        // audio_codes: [1, N, 16] (N can be 0 for flushing)
-        let codes_shape = vec![1i64, n_frames as i64, 16i64];
-        let codes_tensor = Tensor::from_array((codes_shape, codes.to_vec()))?;
-        inputs_vec.push(("audio_codes".into(), codes_tensor.into()));
-
-        // is_last: [1]
-        let is_last_val = if is_final { 1.0f32 } else { 0.0f32 };
-        let is_last_tensor = Tensor::from_array((vec![1i64], vec![is_last_val]))?;
-        inputs_vec.push(("is_last".into(), is_last_tensor.into()));
-
-        // State Tensors
-        let pre_conv_tensor = Tensor::from_array(state.pre_conv_history.clone().into_dyn())?;
-        inputs_vec.push(("pre_conv_history".into(), pre_conv_tensor.into()));
-
-        let latent_tensor = Tensor::from_array(state.latent_buffer.clone().into_dyn())?;
-        inputs_vec.push(("latent_buffer".into(), latent_tensor.into()));
-
-        let conv_tensor = Tensor::from_array(state.conv_history.clone().into_dyn())?;
-        inputs_vec.push(("conv_history".into(), conv_tensor.into()));
-
-        // KV Cache
-        for (i, (k, v)) in state.kv_cache.iter().enumerate() {
-            let k_tensor = Tensor::from_array(k.clone().into_dyn())?;
-            let v_tensor = Tensor::from_array(v.clone().into_dyn())?;
-            inputs_vec.push((format!("past_key_{}", i).into(), k_tensor.into()));
-            inputs_vec.push((format!("past_value_{}", i).into(), v_tensor.into()));
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            match &mut self.backend {
+                AudioDecoderBackend::Burn(decoder) => decoder.decode(codes, state, is_final),
+                AudioDecoderBackend::Onnx(session) => {
+                    decode_onnx_session(session, codes, state, is_final)
+                }
+            }
         }
-
-        // 2. Run Session
-        let outputs = self.session.run(inputs_vec)?;
-
-        // 3. Extract Audio
-        let wav_output = &outputs["final_wav"];
-        let wav_raw = wav_output.try_extract_tensor::<f32>()?;
-        // If outputs["valid_samples"] exists, use it. Python says: outputs[1] is valid_samples.
-        // Let's check output names in Python: final_wav, valid_samples, pre_conv_new, ...
-        // We assume safe to retrieve by name.
-
-        // Handling valid_samples which might be scalar or 1D
-        let valid_count = if let Some(valid_out) = outputs.get("valid_samples") {
-            let valid_raw = valid_out.try_extract_tensor::<i64>()?;
-            valid_raw.1[0] as usize
-        } else {
-            wav_raw.1.len()
-        };
-
-        let audio: Vec<f32> = wav_raw.1.iter().take(valid_count).cloned().collect();
-
-        // 4. Update State (only if not final? Python says "if is_final, state might be dirty but unused")
-        // We update unconditionally to match Python logic which returns new_state.
-
-        let extract_3d = |name: &str| -> Result<Array3<f32>, Box<dyn Error>> {
-            let out = &outputs[name];
-            let raw = out.try_extract_tensor::<f32>()?;
-            let shape = raw.0; // &[usize] or similar
-                               // Convert shape slices/vecs to exact dimensional array construction
-                               // ort 2.0 API might handle shape differently. output shape is typically dynamic.
-                               // We assume dimension correctness from model.
-                               // ndarray::Array::from_shape_vec is simplest if we know dimensions.
-                               // But dimensions change. We use from_iter with shape.
-            let shape_ix: (usize, usize, usize) =
-                (shape[0] as usize, shape[1] as usize, shape[2] as usize);
-            Ok(Array3::from_shape_vec(shape_ix, raw.1.to_vec())?)
-        };
-
-        state.pre_conv_history = extract_3d("next_pre_conv_history")?;
-        state.latent_buffer = extract_3d("next_latent_buffer")?;
-        state.conv_history = extract_3d("next_conv_history")?;
-
-        // Update KV Cache
-        // Names: next_key_0, next_value_0...
-        for i in 0..8 {
-            let k_name = format!("next_key_{}", i);
-            let v_name = format!("next_value_{}", i);
-
-            let out_k = &outputs[k_name.as_str()];
-            let raw_k = out_k.try_extract_tensor::<f32>()?;
-            let shape_k = (
-                raw_k.0[0] as usize,
-                raw_k.0[1] as usize,
-                raw_k.0[2] as usize,
-                raw_k.0[3] as usize,
-            );
-            let arr_k = Array4::from_shape_vec(shape_k, raw_k.1.to_vec())?;
-
-            let out_v = &outputs[v_name.as_str()];
-            let raw_v = out_v.try_extract_tensor::<f32>()?;
-            let shape_v = (
-                raw_v.0[0] as usize,
-                raw_v.0[1] as usize,
-                raw_v.0[2] as usize,
-                raw_v.0[3] as usize,
-            );
-            let arr_v = Array4::from_shape_vec(shape_v, raw_v.1.to_vec())?;
-
-            state.kv_cache[i] = (arr_k, arr_v);
-        }
-
-        Ok(audio)
     }
+}
+
+fn decode_onnx_session(
+    session: &mut Session,
+    codes: &[i64],
+    state: &mut DecoderState,
+    is_final: bool,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let n_frames = codes.len() / 16;
+
+    if n_frames == 0 && !is_final {
+        return Ok(vec![]);
+    }
+
+    let mut inputs_vec: Vec<(std::borrow::Cow<'_, str>, SessionInputValue<'_>)> = Vec::new();
+
+    let codes_shape = vec![1i64, n_frames as i64, 16i64];
+    let codes_tensor = Tensor::from_array((codes_shape, codes.to_vec()))?;
+    inputs_vec.push(("audio_codes".into(), codes_tensor.into()));
+
+    let is_last_val = if is_final { 1.0f32 } else { 0.0f32 };
+    let is_last_tensor = Tensor::from_array((vec![1i64], vec![is_last_val]))?;
+    inputs_vec.push(("is_last".into(), is_last_tensor.into()));
+
+    let pre_conv_tensor = Tensor::from_array(state.pre_conv_history.clone().into_dyn())?;
+    inputs_vec.push(("pre_conv_history".into(), pre_conv_tensor.into()));
+
+    let latent_tensor = Tensor::from_array(state.latent_buffer.clone().into_dyn())?;
+    inputs_vec.push(("latent_buffer".into(), latent_tensor.into()));
+
+    let conv_tensor = Tensor::from_array(state.conv_history.clone().into_dyn())?;
+    inputs_vec.push(("conv_history".into(), conv_tensor.into()));
+
+    for (i, (k, v)) in state.kv_cache.iter().enumerate() {
+        let k_tensor = Tensor::from_array(k.clone().into_dyn())?;
+        let v_tensor = Tensor::from_array(v.clone().into_dyn())?;
+        inputs_vec.push((format!("past_key_{}", i).into(), k_tensor.into()));
+        inputs_vec.push((format!("past_value_{}", i).into(), v_tensor.into()));
+    }
+
+    let outputs = session.run(inputs_vec)?;
+
+    let wav_output = &outputs["final_wav"];
+    let wav_raw = wav_output.try_extract_tensor::<f32>()?;
+
+    let valid_count = if let Some(valid_out) = outputs.get("valid_samples") {
+        let valid_raw = valid_out.try_extract_tensor::<i64>()?;
+        valid_raw.1[0] as usize
+    } else {
+        wav_raw.1.len()
+    };
+
+    let audio: Vec<f32> = wav_raw.1.iter().take(valid_count).cloned().collect();
+
+    let extract_3d = |name: &str| -> Result<Array3<f32>, Box<dyn Error>> {
+        let out = &outputs[name];
+        let raw = out.try_extract_tensor::<f32>()?;
+        let shape_ix: (usize, usize, usize) =
+            (raw.0[0] as usize, raw.0[1] as usize, raw.0[2] as usize);
+        Ok(Array3::from_shape_vec(shape_ix, raw.1.to_vec())?)
+    };
+
+    state.pre_conv_history = extract_3d("next_pre_conv_history")?;
+    state.latent_buffer = extract_3d("next_latent_buffer")?;
+    state.conv_history = extract_3d("next_conv_history")?;
+
+    for i in 0..8 {
+        let k_name = format!("next_key_{}", i);
+        let v_name = format!("next_value_{}", i);
+
+        let out_k = &outputs[k_name.as_str()];
+        let raw_k = out_k.try_extract_tensor::<f32>()?;
+        let shape_k = (
+            raw_k.0[0] as usize,
+            raw_k.0[1] as usize,
+            raw_k.0[2] as usize,
+            raw_k.0[3] as usize,
+        );
+        let arr_k = Array4::from_shape_vec(shape_k, raw_k.1.to_vec())?;
+
+        let out_v = &outputs[v_name.as_str()];
+        let raw_v = out_v.try_extract_tensor::<f32>()?;
+        let shape_v = (
+            raw_v.0[0] as usize,
+            raw_v.0[1] as usize,
+            raw_v.0[2] as usize,
+            raw_v.0[3] as usize,
+        );
+        let arr_v = Array4::from_shape_vec(shape_v, raw_v.1.to_vec())?;
+
+        state.kv_cache[i] = (arr_k, arr_v);
+    }
+
+    Ok(audio)
 }
 
 pub struct DecoderState {
