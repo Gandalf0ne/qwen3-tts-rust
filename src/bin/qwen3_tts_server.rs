@@ -243,7 +243,7 @@ async fn tts_handler(
             let audio_duration_secs = audio.samples.len() as f64 / audio.sample_rate as f64;
             let rtf = start.elapsed().as_secs_f64() / audio_duration_secs;
             println!(
-                "RTF: {:.3} (gen: {:.2}s, audio: {:.2}s)",
+                "RTF: {:.3} (total: {:.2}s, audio: {:.2}s)",
                 rtf,
                 start.elapsed().as_secs_f64(),
                 audio_duration_secs
@@ -274,6 +274,7 @@ async fn openai_speech_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OpenAISpeechRequest>,
 ) -> impl IntoResponse {
+    let start = Instant::now();
     let speaker_name = req.voice;
 
     let voice = match state.speakers.get(&speaker_name) {
@@ -301,6 +302,13 @@ async fn openai_speech_handler(
     match engine.generate_with_voice_streaming(&req.input, &voice, req.instructions.as_deref(), None)
     {
         Ok(audio) => {
+            let audio_duration_secs = audio.samples.len() as f64 / audio.sample_rate as f64;
+            let total_elapsed = start.elapsed().as_secs_f64();
+            let rtf = total_elapsed / audio_duration_secs;
+            println!(
+                "RTF: {:.3} (total: {:.2}s, audio: {:.2}s)",
+                rtf, total_elapsed, audio_duration_secs
+            );
             let wav_data = audio.to_wav_bytes();
             (
                 StatusCode::OK,
@@ -416,7 +424,10 @@ async fn handle_tts_stream(mut socket: WebSocket, state: Arc<AppState>) {
                         let gen_time = stream_start.elapsed().as_secs_f64();
                         let audio_duration = total_samples as f64 / 24000.0;
                         let rtf = if audio_duration > 0.0 { gen_time / audio_duration } else { 0.0 };
-                        eprintln!("[Stream] RTF: {:.3} (gen: {:.2}s, audio: {:.2}s)", rtf, gen_time, audio_duration);
+                        eprintln!(
+                            "[Stream] RTF: {:.3} (total: {:.2}s, audio: {:.2}s)",
+                            rtf, gen_time, audio_duration
+                        );
 
                         let _ = socket.send(Message::Text("segment_done".to_string())).await;
                     } else {

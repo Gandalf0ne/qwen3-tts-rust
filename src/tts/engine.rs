@@ -616,6 +616,7 @@ impl TtsEngine {
         prompt_data: crate::tts::prompt::PromptData,
         stream_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<f32>>>,
     ) -> Result<AudioSample, String> {
+        let generation_started = std::time::Instant::now();
         self.talker_ctx.clear_kv_cache();
         self.predictor_ctx.clear_kv_cache();
 
@@ -655,10 +656,33 @@ impl TtsEngine {
         let streaming_decode_enabled = stream_tx.is_some();
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
         let decoder_arc = self.decoder.clone();
+        let stream_decode_interval = std::env::var("QWEN3_TTS_STREAM_DECODE_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(4);
+        let non_stream_decode_interval = std::env::var("QWEN3_TTS_NONSTREAM_DECODE_FRAMES")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|&value| value > 0)
+            .unwrap_or(32);
+
+        struct DecoderThreadResult {
+            audio: Vec<f32>,
+            active_decode_time: std::time::Duration,
+            chunk_count: usize,
+            frame_count: usize,
+        }
 
         let decoder_handle = std::thread::spawn(move || {
             let mut full_audio = Vec::new();
-            let mut state = AudioDecoder::create_state();
+            let mut state = {
+                let local_decoder = decoder_arc.lock().unwrap();
+                local_decoder.create_state()
+            };
+            let mut active_decode_time = std::time::Duration::default();
+            let mut chunk_count = 0usize;
+            let mut frame_count = 0usize;
 
             while let Ok((codes, is_final)) = rx.recv() {
                 let n_frames = codes.len() / 16;
@@ -681,8 +705,12 @@ impl TtsEngine {
 
                 let safe_codes: Vec<i64> = codes.iter().map(|&c| c.clamp(0, 2047)).collect();
 
+                let chunk_started = std::time::Instant::now();
                 let mut local_decoder = decoder_arc.lock().unwrap();
                 if let Ok(samples) = local_decoder.decode(&safe_codes, &mut state, is_final) {
+                    active_decode_time += chunk_started.elapsed();
+                    chunk_count += 1;
+                    frame_count += n_frames;
                     if !samples.is_empty() {
                         if let Some(ref stx) = stream_tx {
                             let _ = stx.send(samples.clone());
@@ -691,7 +719,12 @@ impl TtsEngine {
                     }
                 }
             }
-            full_audio
+            DecoderThreadResult {
+                audio: full_audio,
+                active_decode_time,
+                chunk_count,
+                frame_count,
+            }
         });
 
         let tts_pad = self.assets.tts_pad.clone();
@@ -702,8 +735,6 @@ impl TtsEngine {
         const SILENT_PENALTY_MAX_FRAMES: usize = 8; // 0.6秒(8帧)后极大惩罚
         const SILENT_PENALTY_VALUE: f32 = 2.0;
 
-        // 流式发送参数
-        const SEND_INTERVAL: usize = 4;
         let mut consecutive_silent_frames: usize = 0;
         let mut last_sent_frame: usize = 0;
 
@@ -833,9 +864,9 @@ impl TtsEngine {
             // 流式发送
             let current_frame = all_codes.len() / 16;
 
-            if streaming_decode_enabled && current_frame > last_sent_frame + SEND_INTERVAL {
+            if streaming_decode_enabled && current_frame >= last_sent_frame + stream_decode_interval {
                 let start_frame = last_sent_frame;
-                let end_frame = last_sent_frame + SEND_INTERVAL;
+                let end_frame = last_sent_frame + stream_decode_interval;
 
                 let start_idx = start_frame * 16;
                 let end_idx = end_frame * 16;
@@ -845,7 +876,7 @@ impl TtsEngine {
                     .collect();
 
                 let _ = tx.send((frame_codes, false));
-                last_sent_frame += SEND_INTERVAL;
+                last_sent_frame += stream_decode_interval;
             }
 
             let mut feedback = vec![0.0f32; 2048];
@@ -901,7 +932,7 @@ impl TtsEngine {
             } else {
                 let mut start_frame = 0;
                 while start_frame < total_frames {
-                    let end_frame = (start_frame + SEND_INTERVAL).min(total_frames);
+                    let end_frame = (start_frame + non_stream_decode_interval).min(total_frames);
                     let is_final = end_frame == total_frames;
                     let start_idx = start_frame * 16;
                     let end_idx = end_frame * 16;
@@ -918,13 +949,29 @@ impl TtsEngine {
         }
 
         drop(tx);
+        let generation_elapsed = generation_started.elapsed();
 
-        let audio_samples = decoder_handle
+        let decoder_result = decoder_handle
             .join()
             .map_err(|_| "Decoder thread panicked".to_string())?;
 
+        let total_elapsed = generation_elapsed + decoder_result.active_decode_time;
+        println!(
+            "Timing: generation={:.2}s decode={:.2}s total={:.2}s decode_chunks={} decode_frames={} mode={}",
+            generation_elapsed.as_secs_f64(),
+            decoder_result.active_decode_time.as_secs_f64(),
+            total_elapsed.as_secs_f64(),
+            decoder_result.chunk_count,
+            decoder_result.frame_count,
+            if streaming_decode_enabled {
+                "streaming"
+            } else {
+                "non-streaming"
+            }
+        );
+
         Ok(AudioSample {
-            samples: audio_samples,
+            samples: decoder_result.audio,
             sample_rate: 24000,
             channels: 1,
         })

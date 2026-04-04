@@ -10,7 +10,7 @@ use ort::value::Tensor;
 use std::error::Error;
 
 #[cfg(not(any(windows, target_os = "macos")))]
-use crate::models::burn_decoder::BurnAudioDecoder;
+use crate::models::burn_decoder::{BurnAudioDecoder, BurnDecoderState};
 
 #[cfg(windows)]
 use ort::execution_providers::DirectMLExecutionProvider;
@@ -449,8 +449,19 @@ impl AudioDecoder {
         }
     }
 
-    pub fn create_state() -> DecoderState {
-        DecoderState::new()
+    pub fn create_state(&self) -> DecoderState {
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            DecoderState::new()
+        }
+
+        #[cfg(not(any(windows, target_os = "macos")))]
+        {
+            match &self.backend {
+                AudioDecoderBackend::Burn(decoder) => decoder.create_state(),
+                AudioDecoderBackend::Onnx(_) => DecoderState::new(),
+            }
+        }
     }
 
     pub fn decode(
@@ -482,6 +493,7 @@ fn decode_onnx_session(
     state: &mut DecoderState,
     is_final: bool,
 ) -> Result<Vec<f32>, Box<dyn Error>> {
+    let state = state.host_mut()?;
     let n_frames = codes.len() / 16;
 
     if n_frames == 0 && !is_final {
@@ -570,20 +582,20 @@ fn decode_onnx_session(
     Ok(audio)
 }
 
-pub struct DecoderState {
+pub(crate) struct HostDecoderState {
     pub pre_conv_history: Array3<f32>,
     pub latent_buffer: Array3<f32>,
     pub conv_history: Array3<f32>,
     pub kv_cache: Vec<(Array4<f32>, Array4<f32>)>,
 }
 
-impl Default for DecoderState {
+impl Default for HostDecoderState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DecoderState {
+impl HostDecoderState {
     pub fn new() -> Self {
         // Match Python: np.zeros((1, 512, 0)) etc.
         let pre_conv_history = Array3::<f32>::zeros((1, 512, 0));
@@ -598,11 +610,62 @@ impl DecoderState {
             kv_cache.push((k, v));
         }
 
-        DecoderState {
+        HostDecoderState {
             pre_conv_history,
             latent_buffer,
             conv_history,
             kv_cache,
+        }
+    }
+}
+
+enum DecoderStateInner {
+    Host(HostDecoderState),
+    #[cfg(not(any(windows, target_os = "macos")))]
+    Burn(BurnDecoderState),
+}
+
+pub struct DecoderState {
+    inner: DecoderStateInner,
+}
+
+impl Default for DecoderState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DecoderState {
+    pub fn new() -> Self {
+        Self {
+            inner: DecoderStateInner::Host(HostDecoderState::new()),
+        }
+    }
+
+    fn host_mut(&mut self) -> Result<&mut HostDecoderState, Box<dyn Error>> {
+        match &mut self.inner {
+            DecoderStateInner::Host(state) => Ok(state),
+            #[cfg(not(any(windows, target_os = "macos")))]
+            DecoderStateInner::Burn(_) => {
+                Err("Decoder state backend mismatch: expected ONNX host state".into())
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub(crate) fn from_burn(state: BurnDecoderState) -> Self {
+        Self {
+            inner: DecoderStateInner::Burn(state),
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
+    pub(crate) fn burn_mut(&mut self) -> Result<&mut BurnDecoderState, Box<dyn Error>> {
+        match &mut self.inner {
+            DecoderStateInner::Burn(state) => Ok(state),
+            DecoderStateInner::Host(_) => {
+                Err("Decoder state backend mismatch: expected Burn GPU state".into())
+            }
         }
     }
 }

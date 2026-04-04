@@ -3,14 +3,13 @@ use crate::models::onnx::DecoderState;
 use burn::prelude::*;
 use burn::tensor::TensorData;
 use burn_onnx::ModelGen;
-use ndarray::{Array3, Array4};
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-type BurnBackend = burn_wgpu::Wgpu<f32, i64, u32>;
-type BurnDevice = burn_wgpu::WgpuDevice;
+pub(crate) type BurnBackend = burn_wgpu::Wgpu<f32, i64, u32>;
+pub(crate) type BurnDevice = burn_wgpu::WgpuDevice;
 type BurnModel = burn_decoder_generated::Model<BurnBackend>;
 
 const PREPARE_SCRIPT: &str =
@@ -24,6 +23,37 @@ const GENERATED_RS_NAME: &str = "qwen3_tts_decoder.inferred.rs";
 pub struct BurnAudioDecoder {
     device: BurnDevice,
     model: BurnModel,
+}
+
+pub(crate) struct BurnDecoderState {
+    pre_conv_history: Tensor<BurnBackend, 3>,
+    latent_buffer: Tensor<BurnBackend, 3>,
+    conv_history: Tensor<BurnBackend, 3>,
+    past_keys: Vec<Tensor<BurnBackend, 4>>,
+    past_values: Vec<Tensor<BurnBackend, 4>>,
+}
+
+impl BurnDecoderState {
+    fn new(device: &BurnDevice) -> Self {
+        let pre_conv_history = float_tensor(Vec::new(), [1, 512, 0], device);
+        let latent_buffer = float_tensor(Vec::new(), [1, 1024, 0], device);
+        let conv_history = float_tensor(Vec::new(), [1, 1024, 0], device);
+
+        let mut past_keys = Vec::with_capacity(8);
+        let mut past_values = Vec::with_capacity(8);
+        for _ in 0..8 {
+            past_keys.push(float_tensor(Vec::new(), [1, 16, 0, 64], device));
+            past_values.push(float_tensor(Vec::new(), [1, 16, 0, 64], device));
+        }
+
+        Self {
+            pre_conv_history,
+            latent_buffer,
+            conv_history,
+            past_keys,
+            past_values,
+        }
+    }
 }
 
 impl BurnAudioDecoder {
@@ -47,12 +77,17 @@ impl BurnAudioDecoder {
         Ok(Self { device, model })
     }
 
+    pub fn create_state(&self) -> DecoderState {
+        DecoderState::from_burn(BurnDecoderState::new(&self.device))
+    }
+
     pub fn decode(
         &mut self,
         codes: &[i64],
         state: &mut DecoderState,
         is_final: bool,
     ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let state = state.burn_mut()?;
         let n_frames = codes.len() / 16;
         if n_frames == 0 && !is_final {
             return Ok(vec![]);
@@ -60,20 +95,6 @@ impl BurnAudioDecoder {
 
         let audio_codes = int_tensor(codes.to_vec(), [1, n_frames, 16], &self.device);
         let is_last = float_tensor(vec![if is_final { 1.0 } else { 0.0 }], [1], &self.device);
-        let pre_conv_history = array3_tensor(&state.pre_conv_history, &self.device);
-        let latent_buffer = array3_tensor(&state.latent_buffer, &self.device);
-        let conv_history = array3_tensor(&state.conv_history, &self.device);
-
-        let past_keys: Vec<_> = state
-            .kv_cache
-            .iter()
-            .map(|(k, _)| array4_tensor(k, &self.device))
-            .collect();
-        let past_values: Vec<_> = state
-            .kv_cache
-            .iter()
-            .map(|(_, v)| array4_tensor(v, &self.device))
-            .collect();
 
         let (
             final_wav,
@@ -100,25 +121,25 @@ impl BurnAudioDecoder {
         ) = self.model.forward(
             audio_codes,
             is_last,
-            pre_conv_history,
-            latent_buffer,
-            conv_history,
-            past_keys[0].clone(),
-            past_keys[1].clone(),
-            past_keys[2].clone(),
-            past_keys[3].clone(),
-            past_keys[4].clone(),
-            past_keys[5].clone(),
-            past_keys[6].clone(),
-            past_keys[7].clone(),
-            past_values[0].clone(),
-            past_values[1].clone(),
-            past_values[2].clone(),
-            past_values[3].clone(),
-            past_values[4].clone(),
-            past_values[5].clone(),
-            past_values[6].clone(),
-            past_values[7].clone(),
+            state.pre_conv_history.clone(),
+            state.latent_buffer.clone(),
+            state.conv_history.clone(),
+            state.past_keys[0].clone(),
+            state.past_keys[1].clone(),
+            state.past_keys[2].clone(),
+            state.past_keys[3].clone(),
+            state.past_keys[4].clone(),
+            state.past_keys[5].clone(),
+            state.past_keys[6].clone(),
+            state.past_keys[7].clone(),
+            state.past_values[0].clone(),
+            state.past_values[1].clone(),
+            state.past_values[2].clone(),
+            state.past_values[3].clone(),
+            state.past_values[4].clone(),
+            state.past_values[5].clone(),
+            state.past_values[6].clone(),
+            state.past_values[7].clone(),
         );
 
         let valid_samples = valid_samples.to_data().to_vec::<i64>()?;
@@ -131,9 +152,9 @@ impl BurnAudioDecoder {
         let mut audio = final_wav.to_data().to_vec::<f32>()?;
         audio.truncate(valid_count);
 
-        state.pre_conv_history = tensor_to_array3(next_pre_conv_history)?;
-        state.latent_buffer = tensor_to_array3(next_latent_buffer)?;
-        state.conv_history = tensor_to_array3(next_conv_history)?;
+        state.pre_conv_history = next_pre_conv_history;
+        state.latent_buffer = next_latent_buffer;
+        state.conv_history = next_conv_history;
 
         let next_keys = vec![
             next_key_0, next_key_1, next_key_2, next_key_3, next_key_4, next_key_5, next_key_6,
@@ -155,7 +176,8 @@ impl BurnAudioDecoder {
             .zip(next_values.into_iter())
             .enumerate()
         {
-            state.kv_cache[index] = (tensor_to_array4(next_key)?, tensor_to_array4(next_value)?);
+            state.past_keys[index] = next_key;
+            state.past_values[index] = next_value;
         }
 
         Ok(audio)
@@ -281,40 +303,4 @@ fn int_tensor<const D: usize>(
     device: &BurnDevice,
 ) -> Tensor<BurnBackend, D, Int> {
     Tensor::from_data(TensorData::new(values, shape).convert::<i64>(), device)
-}
-
-fn array3_tensor(array: &Array3<f32>, device: &BurnDevice) -> Tensor<BurnBackend, 3> {
-    let shape = [array.shape()[0], array.shape()[1], array.shape()[2]];
-    float_tensor(array.iter().copied().collect(), shape, device)
-}
-
-fn array4_tensor(array: &Array4<f32>, device: &BurnDevice) -> Tensor<BurnBackend, 4> {
-    let shape = [
-        array.shape()[0],
-        array.shape()[1],
-        array.shape()[2],
-        array.shape()[3],
-    ];
-    float_tensor(array.iter().copied().collect(), shape, device)
-}
-
-fn tensor_to_array3(tensor: Tensor<BurnBackend, 3>) -> Result<Array3<f32>, Box<dyn Error>> {
-    let data = tensor.to_data();
-    let shape = (
-        data.shape[0] as usize,
-        data.shape[1] as usize,
-        data.shape[2] as usize,
-    );
-    Ok(Array3::from_shape_vec(shape, data.to_vec::<f32>()?)?)
-}
-
-fn tensor_to_array4(tensor: Tensor<BurnBackend, 4>) -> Result<Array4<f32>, Box<dyn Error>> {
-    let data = tensor.to_data();
-    let shape = (
-        data.shape[0] as usize,
-        data.shape[1] as usize,
-        data.shape[2] as usize,
-        data.shape[3] as usize,
-    );
-    Ok(Array4::from_shape_vec(shape, data.to_vec::<f32>()?)?)
 }
