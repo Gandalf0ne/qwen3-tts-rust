@@ -765,7 +765,6 @@ checksum = "2ae0e2f5c465e2e862b4fdb50015e8fdb97a381380baa14fd73ccb9b39609e5f"
 dependencies = [
  "burn-backend",
  "burn-cubecl",
- "burn-fusion",
  "cubecl",
 ]
 
