@@ -48,15 +48,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2t64 \
     libgomp1 \
     curl \
+    libxext6 \
     && rm -rf /var/lib/apt/lists/*
 
 ENV LD_LIBRARY_PATH=/app:/app/runtime
+# Point Vulkan loader to the AMD RADV ICD (primary deployment target).
+# On NVIDIA hosts, mount the host nvidia_icd.json via docker-compose instead.
+ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.json
+# Suppress Dawn validation noise in logs
+ENV DAWN_DISABLE_VALIDATION=1
 
 # Working directory — critical: the app resolves "runtime/" and "models/"
 # relative to CWD via hardcoded paths in the source code
 WORKDIR /app
 
-# Copy the compiled binary and its runtime dependency (Dawn WebGPU/Vulkan backend)
+# Copy the compiled binary and Dawn WebGPU shared lib (required by ort WebGPU EP)
 COPY --from=builder /build/target/release/qwen3_tts_server /app/qwen3_tts_server
 COPY --from=builder /build/target/release/libwebgpu_dawn.so /app/libwebgpu_dawn.so
 

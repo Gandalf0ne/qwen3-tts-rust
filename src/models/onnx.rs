@@ -57,18 +57,17 @@ fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
     }
 }
 
-/// 创建 GPU Session (Linux — defaults to CPU; WebGPU/Dawn is experimental)
-/// Dawn WebGPU produces silent/incorrect audio on many AMD GPUs (RADV).
-/// Set QWEN3_TTS_ONNX_WEBGPU=1 to opt into WebGPU acceleration.
+/// 创建 GPU Session (Linux — defaults to WebGPU/Dawn via Vulkan)
+/// Falls back to CPU if WebGPU init fails or QWEN3_TTS_ONNX_CPU=1 is set.
 #[cfg(not(any(windows, target_os = "macos")))]
 fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
-    if std::env::var("QWEN3_TTS_ONNX_WEBGPU").unwrap_or_default() == "1" {
-        println!("  [ONNX] QWEN3_TTS_ONNX_WEBGPU=1, using WebGPU (Dawn/Vulkan) — experimental");
-        return create_webgpu_session(model_path);
+    if std::env::var("QWEN3_TTS_ONNX_CPU").unwrap_or_default() == "1" {
+        println!("  [ONNX] QWEN3_TTS_ONNX_CPU=1, forcing CPU for ONNX");
+        return create_cpu_session(model_path);
     }
 
-    println!("  [ONNX] Using CPU for ONNX decoder (default on Linux; set QWEN3_TTS_ONNX_WEBGPU=1 to try GPU)");
-    create_cpu_session(model_path)
+    println!("  [ONNX] Using WebGPU (Dawn/Vulkan) for ONNX inference");
+    create_webgpu_session(model_path)
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
