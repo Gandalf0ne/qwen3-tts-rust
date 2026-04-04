@@ -148,11 +148,15 @@ impl DecoderClient {
             let warmup_frames = std::env::var("QWEN3_TTS_DECODER_WARMUP_FRAMES")
                 .ok()
                 .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(32);
+                .unwrap_or(0);
 
             if warmup_frames > 0 {
                 let warmup_started = Instant::now();
                 let warmup_codes = vec![0_i64; warmup_frames * 16];
+                println!(
+                    "AudioDecoder warmup starting: frames={}",
+                    warmup_frames
+                );
                 match decoder.decode(&warmup_codes, &mut state, true) {
                     Ok(samples) => {
                         println!(
