@@ -145,6 +145,34 @@ impl DecoderClient {
                 }
             };
             let mut state = decoder.create_state();
+            let warmup_frames = std::env::var("QWEN3_TTS_DECODER_WARMUP_FRAMES")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(32);
+
+            if warmup_frames > 0 {
+                let warmup_started = Instant::now();
+                let warmup_codes = vec![0_i64; warmup_frames * 16];
+                match decoder.decode(&warmup_codes, &mut state, true) {
+                    Ok(samples) => {
+                        println!(
+                            "AudioDecoder warmup complete: frames={} samples={} elapsed={:.2}s",
+                            warmup_frames,
+                            samples.len(),
+                            warmup_started.elapsed().as_secs_f64()
+                        );
+                    }
+                    Err(error) => {
+                        println!(
+                            "AudioDecoder warmup failed after {:.2}s: {}",
+                            warmup_started.elapsed().as_secs_f64(),
+                            error
+                        );
+                    }
+                }
+                state = decoder.create_state();
+            }
+
             let _ = ready_tx.send(Ok(()));
 
             while let Ok(command) = rx.recv() {
