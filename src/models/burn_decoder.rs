@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) type BurnBackend = burn_wgpu::Wgpu<f32, i64, u32>;
+pub(crate) type BurnBackend = burn_wgpu::Wgpu<half::f16, i64, u32>;
 pub(crate) type BurnDevice = burn_wgpu::WgpuDevice;
 type BurnModel = burn_decoder_generated::Model<BurnBackend>;
 
@@ -299,7 +299,7 @@ fn float_tensor<const D: usize>(
     shape: [usize; D],
     device: &BurnDevice,
 ) -> Tensor<BurnBackend, D> {
-    Tensor::from_data(TensorData::new(values, shape).convert::<f32>(), device)
+    Tensor::from_data(TensorData::new(values, shape).convert::<half::f16>(), device)
 }
 
 fn int_tensor<const D: usize>(

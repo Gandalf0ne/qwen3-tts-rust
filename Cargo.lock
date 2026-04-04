@@ -4531,6 +4531,7 @@ dependencies = [
  "cpal",
  "flate2",
  "futures-util",
+ "half",
  "hound",
  "indicatif 0.17.11",
  "libc",
