@@ -4,11 +4,12 @@ services:
     build:
       context: .
     image: qwen3-tts-rust:local-cpu
-    # The image auto-falls back to CPU when no /dev/dri device is present.
-    # Uncomment these only if you want to force a backend manually.
-    # environment:
-    #   QWEN3_TTS_RUNTIME_BACKEND: cpu
-    #   QWEN3_TTS_N_GPU_LAYERS: "0"
+    environment:
+      # Force ONNX decoder to CPU — WebGPU (Dawn/Vulkan) produces silent audio on some GPUs
+      QWEN3_TTS_ONNX_CPU: "1"
+      # Uncomment to force llama.cpp to a specific backend:
+      # QWEN3_TTS_RUNTIME_BACKEND: cpu
+      # QWEN3_TTS_N_GPU_LAYERS: "0"
     ports:
       - "3100:3000"
     healthcheck:
