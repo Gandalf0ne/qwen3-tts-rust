@@ -17,9 +17,11 @@ services:
       timeout: 10s
       retries: 3
       start_period: 300s
-    environment:
-      # Force ONNX decoder to CPU — WebGPU (Dawn/Vulkan) produces silent audio on RADV GPUs
-      QWEN3_TTS_ONNX_CPU: "1"
+    # ONNX decoder runs on CPU by default (Dawn WebGPU is broken on many AMD GPUs).
+    # llama.cpp LLM inference still uses Vulkan GPU.
+    # Uncomment to experiment with WebGPU for ONNX:
+    # environment:
+    #   QWEN3_TTS_ONNX_WEBGPU: "1"
     restart: unless-stopped
     volumes:
       # Models: GGUF + ONNX files (~4-6 GB, downloaded on first run)

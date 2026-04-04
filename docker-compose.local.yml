@@ -4,12 +4,11 @@ services:
     build:
       context: .
     image: qwen3-tts-rust:local-cpu
-    environment:
-      # Force ONNX decoder to CPU — WebGPU (Dawn/Vulkan) produces silent audio on some GPUs
-      QWEN3_TTS_ONNX_CPU: "1"
-      # Uncomment to force llama.cpp to a specific backend:
-      # QWEN3_TTS_RUNTIME_BACKEND: cpu
-      # QWEN3_TTS_N_GPU_LAYERS: "0"
+    # ONNX decoder runs on CPU by default. Uncomment to experiment:
+    # environment:
+    #   QWEN3_TTS_ONNX_WEBGPU: "1"          # Opt into WebGPU for ONNX (experimental)
+    #   QWEN3_TTS_RUNTIME_BACKEND: cpu       # Force llama.cpp to CPU
+    #   QWEN3_TTS_N_GPU_LAYERS: "0"
     ports:
       - "3100:3000"
     healthcheck:
