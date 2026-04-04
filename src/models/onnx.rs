@@ -58,8 +58,14 @@ fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
 }
 
 /// 创建 GPU Session using WebGPU EP (Linux — Dawn/Vulkan backend)
+/// Set QWEN3_TTS_ONNX_CPU=1 to force CPU execution (useful when WebGPU produces incorrect results)
 #[cfg(not(any(windows, target_os = "macos")))]
 fn create_gpu_session(model_path: &str) -> Result<Session, Box<dyn Error>> {
+    if std::env::var("QWEN3_TTS_ONNX_CPU").unwrap_or_default() == "1" {
+        println!("  [ONNX] QWEN3_TTS_ONNX_CPU=1, forcing CPU execution.");
+        return create_cpu_session(model_path);
+    }
+
     println!("  [ONNX] Requesting Execution Providers: WebGPU (Vulkan backend)");
     let builder = Session::builder()?;
     let builder = builder.with_optimization_level(GraphOptimizationLevel::Level3)?;
