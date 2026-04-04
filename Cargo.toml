@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["full"] }
 ndarray = "0.17"
 ndarray-npy = "0.8"
 rand = "0.8"
-ort = { version = "=2.0.0-rc.12", features = ["ndarray", "load-dynamic", "cuda", "directml"] }
+ort = { version = "=2.0.0-rc.12", features = ["ndarray", "load-dynamic", "directml", "webgpu"] }
 tokenizers = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
@@ -44,9 +44,10 @@ tokio-tungstenite = "0.26"
 base64 = "0.22"
 
 [features]
-cuda = []
-vulkan = []
-profile = []  # 启用性能分析计时
+cuda = ["ort/cuda"]
+webgpu = ["ort/webgpu"]
+vulkan = []    # still used for llama.cpp backend selection in download.rs
+profile = []   # 启用性能分析计时
 
 
 [target.'cfg(windows)'.dependencies]
@@ -56,3 +57,4 @@ winapi = { version = "0.3", features = ["consoleapi", "fileapi", "handleapi", "w
 opt-level = 3
 lto = true
 codegen-units = 1
+rpath = true

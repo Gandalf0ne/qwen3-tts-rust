@@ -86,56 +86,6 @@ impl Downloader {
         path_str.contains(&dir_marker)
     }
 
-    fn onnx_runtime_version_stamp(runtime_dir: &Path) -> std::path::PathBuf {
-        runtime_dir.join(".onnxruntime-version")
-    }
-
-    fn should_refresh_onnx_runtime(
-        runtime_dir: &Path,
-        dll_name: &str,
-        ort_version: &str,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
-        if !runtime_dir.join(dll_name).exists() {
-            return Ok(true);
-        }
-
-        let stamp_path = Self::onnx_runtime_version_stamp(runtime_dir);
-        let recorded_version = std::fs::read_to_string(stamp_path)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-
-        Ok(recorded_version != ort_version)
-    }
-
-    fn clear_existing_onnx_runtime(
-        runtime_dir: &Path,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if !runtime_dir.exists() {
-            return Ok(());
-        }
-
-        for entry in std::fs::read_dir(runtime_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-
-            if !file_name.contains("onnxruntime") {
-                continue;
-            }
-
-            if path.is_dir() {
-                std::fs::remove_dir_all(path)?;
-            } else {
-                std::fs::remove_file(path)?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub async fn new() -> Self {
         let client = Client::new();
         // Check connectivity to huggingface.co for MODELS
@@ -280,59 +230,10 @@ impl Downloader {
             "tar.gz"
         };
 
-        // 1. ONNX Runtime
-        // ort v2.0.0-rc.12 requires ONNX Runtime >= 1.24.x. Keeping this in sync
-        // avoids a deadlock in the crate's older-version error path.
-        let ort_version = "1.24.1";
-        let ort_ext = if os == "win" { "zip" } else { "tgz" };
-        let ort_filename = format!("onnxruntime-{}-{}-{}.{}", os, arch, ort_version, ort_ext);
-        let ort_dll_name = if os == "win" {
-            "onnxruntime.dll"
-        } else if os == "osx" {
-            "libonnxruntime.dylib"
-        } else {
-            "libonnxruntime.so"
-        };
+        // ONNX Runtime is managed by the ort crate at compile time (WebGPU-enabled).
+        // The runtime/ directory is now only for llama.cpp libraries.
 
-        if Self::should_refresh_onnx_runtime(runtime_dir, ort_dll_name, ort_version)? {
-            if runtime_dir.join(ort_dll_name).exists() {
-                println!(
-                    "Refreshing ONNX Runtime to {} ({}-{})...",
-                    ort_version, os, arch
-                );
-                Self::clear_existing_onnx_runtime(runtime_dir)?;
-            } else {
-                println!("Downloading ONNX Runtime ({}-{})...", os, arch);
-            }
-
-            let ort_url = format!(
-                "https://github.com/microsoft/onnxruntime/releases/download/v{}/{}",
-                ort_version, ort_filename
-            );
-            let tmp_zip = Path::new("ort_runtime.tmp");
-            self.download_to_file(&ort_url, tmp_zip).await?;
-
-            println!("Extracting ONNX Runtime...");
-            if ort_ext == "zip" {
-                self.extract_zip(
-                    tmp_zip,
-                    runtime_dir,
-                    &format!("onnxruntime-{}-{}-{}", os, arch, ort_version),
-                    "lib",
-                )?;
-            } else {
-                self.extract_targz(
-                    tmp_zip,
-                    runtime_dir,
-                    &format!("onnxruntime-{}-{}-{}", os, arch, ort_version),
-                    "lib",
-                )?;
-            }
-            let _ = std::fs::remove_file(tmp_zip);
-            std::fs::write(Self::onnx_runtime_version_stamp(runtime_dir), ort_version)?;
-        }
-
-        // 2. Llama.cpp / GGML (Official Release)
+        // Llama.cpp / GGML (Official Release)
         let llama_dll = if os == "win" {
             "llama.dll"
         } else if os == "osx" {

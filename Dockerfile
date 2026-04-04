@@ -18,15 +18,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /build
 
 # Copy manifests first for layer caching
-COPY Cargo.toml Cargo.lock* build.rs ./
+COPY Cargo.toml Cargo.lock* build.rs .cargo/ ./
 COPY src/ src/
 COPY webui/ webui/
 COPY speakers/ speakers/
 
 # Build the server binary in release mode
-# Note: The "vulkan" feature is not needed at compile time — the download.rs
-# code defaults to Vulkan on Linux regardless. We build with default features.
 RUN cargo build --release --bin qwen3_tts_server
+
+# Find and stage the ort-managed ORT library (with WebGPU support)
+RUN mkdir -p /build/ort-libs && \
+    find /root/.cache/ort -name "libonnxruntime.so*" -exec cp {} /build/ort-libs/ \; && \
+    find /root/.cache/ort -name "libdawn*" -exec cp {} /build/ort-libs/ \; && \
+    find /root/.cache/ort -name "libwebgpu*" -exec cp {} /build/ort-libs/ \; || true
 
 # =============================================================================
 # Stage 2: Runtime image
@@ -61,11 +65,17 @@ COPY --from=builder /build/target/release/qwen3_tts_server /app/qwen3_tts_server
 # Copy default speaker profiles (can be overridden via volume mount)
 COPY --from=builder /build/speakers/ /app/speakers/
 
+# Copy the ort-managed ORT libraries alongside the binary
+COPY --from=builder /build/ort-libs/ /app/
+
+# Tell ort where to find the WebGPU-enabled binary
+ENV ORT_DYLIB_PATH=/app/libonnxruntime.so
+
 EXPOSE 3000
 
 # On first run, the binary auto-downloads into:
 #   /app/models/   — GGUF + ONNX model files (~4-6 GB)
-#   /app/runtime/  — llama.cpp + ONNX Runtime shared libs (~200 MB)
+#   /app/runtime/  — llama.cpp shared libs (~200 MB)
 # Both directories should be persistent volumes.
 ENTRYPOINT ["/app/qwen3_tts_server"]
 CMD ["--host", "0.0.0.0", "--port", "3000", "--model-dir", "models", "--speakers-dir", "speakers", "--threads", "8"]
