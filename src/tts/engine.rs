@@ -652,9 +652,8 @@ impl TtsEngine {
             seed,
         );
 
+        let streaming_decode_enabled = stream_tx.is_some();
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<i64>, bool)>();
-
-        let tts_pad = self.assets.tts_pad.clone();
         let decoder_arc = self.decoder.clone();
 
         let decoder_handle = std::thread::spawn(move || {
@@ -694,6 +693,8 @@ impl TtsEngine {
             }
             full_audio
         });
+
+        let tts_pad = self.assets.tts_pad.clone();
 
         // 连续静音检测参数 (12.5Hz = 80ms/帧)
         const MAX_SILENT_FRAMES: usize = 15; // 1.2秒强制停止
@@ -832,7 +833,7 @@ impl TtsEngine {
             // 流式发送
             let current_frame = all_codes.len() / 16;
 
-            if current_frame > last_sent_frame + SEND_INTERVAL {
+            if streaming_decode_enabled && current_frame > last_sent_frame + SEND_INTERVAL {
                 let start_frame = last_sent_frame;
                 let end_frame = last_sent_frame + SEND_INTERVAL;
 
@@ -876,21 +877,46 @@ impl TtsEngine {
         // 发送剩余的帧
         let total_frames = all_codes.len() / 16;
 
-        if total_frames > last_sent_frame {
-            let start_frame = last_sent_frame;
-            let end_frame = total_frames;
+        if streaming_decode_enabled {
+            if total_frames > last_sent_frame {
+                let start_frame = last_sent_frame;
+                let end_frame = total_frames;
 
-            let start_idx = start_frame * 16;
-            let end_idx = end_frame * 16;
-            let frame_codes: Vec<i64> = all_codes[start_idx..end_idx]
-                .iter()
-                .map(|&c| c as i64)
-                .collect();
+                let start_idx = start_frame * 16;
+                let end_idx = end_frame * 16;
+                let frame_codes: Vec<i64> = all_codes[start_idx..end_idx]
+                    .iter()
+                    .map(|&c| c as i64)
+                    .collect();
 
-            let _ = tx.send((frame_codes, true));
+                let _ = tx.send((frame_codes, true));
+            } else {
+                let _ = tx.send((Vec::new(), true));
+            }
         } else {
-            let _ = tx.send((Vec::new(), true));
+            // Keep non-streaming decode off the critical path so talker/predictor
+            // generation does not contend with the audio decoder on the same GPU.
+            if total_frames == 0 {
+                let _ = tx.send((Vec::new(), true));
+            } else {
+                let mut start_frame = 0;
+                while start_frame < total_frames {
+                    let end_frame = (start_frame + SEND_INTERVAL).min(total_frames);
+                    let is_final = end_frame == total_frames;
+                    let start_idx = start_frame * 16;
+                    let end_idx = end_frame * 16;
+                    let frame_codes: Vec<i64> = all_codes[start_idx..end_idx]
+                        .iter()
+                        .map(|&c| c as i64)
+                        .collect();
+
+                    tx.send((frame_codes, is_final))
+                        .map_err(|e| format!("Audio decode scheduling failed: {}", e))?;
+                    start_frame = end_frame;
+                }
+            }
         }
+
         drop(tx);
 
         let audio_samples = decoder_handle
