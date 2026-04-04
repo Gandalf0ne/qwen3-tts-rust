@@ -47,7 +47,7 @@ jobs:
             bin: qwen3_tts
             name: qwen3-tts-linux-x64-vulkan.tar.gz
             llama_url: https://github.com/ggerganov/llama.cpp/releases/download/b7885/llama-b7885-bin-ubuntu-vulkan-x64.tar.gz
-            ort_url: https://github.com/microsoft/onnxruntime/releases/download/v1.24.1/onnxruntime-linux-x64-1.24.1.tgz
+            ort_url: ""  # ORT is statically linked via ort-sys (WebGPU-enabled)
 
           # macOS Metal
           - os_name: macOS-ARM64
@@ -117,22 +117,23 @@ jobs:
         shell: bash
         run: |
           # Download Llama.cpp
-          # Check if URL exists (optional but good practice)
           wget -O llama.tar.gz "${{ matrix.platform.llama_url }}"
           tar -xzvf llama.tar.gz -C dist/runtime
           rm llama.tar.gz
 
-          # Download ONNX Runtime
-          wget -O ort.tgz "${{ matrix.platform.ort_url }}"
-          mkdir ort_temp
-          tar -xzvf ort.tgz -C ort_temp
-          
-          # Copy libs
-          find ort_temp -name "*.so*" -exec cp {} dist/runtime/ \;
-          find ort_temp -name "*.dylib" -exec cp {} dist/runtime/ \;
-          
-          rm ort.tgz
-          rm -rf ort_temp
+          # Download ONNX Runtime (only if URL is provided — Linux uses statically linked ORT)
+          if [ -n "${{ matrix.platform.ort_url }}" ]; then
+            wget -O ort.tgz "${{ matrix.platform.ort_url }}"
+            mkdir ort_temp
+            tar -xzvf ort.tgz -C ort_temp
+            find ort_temp -name "*.so*" -exec cp {} dist/runtime/ \;
+            find ort_temp -name "*.dylib" -exec cp {} dist/runtime/ \;
+            rm ort.tgz
+            rm -rf ort_temp
+          fi
+
+          # Copy WebGPU Dawn runtime library (needed by statically linked ORT with WebGPU EP)
+          find target/${{ matrix.platform.target }}/release -maxdepth 1 -name "libwebgpu_dawn*" -exec cp {} dist/ \; 2>/dev/null || true
 
       - name: Archive Release (Windows)
         if: runner.os == 'Windows'

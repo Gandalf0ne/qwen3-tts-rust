@@ -21,7 +21,7 @@ services:
     volumes:
       # Models: GGUF + ONNX files (~4-6 GB, downloaded on first run)
       - /mnt/ssd_speicher/generic/qwen3-tts/models:/app/models:rw
-      # Runtime: llama.cpp + ONNX Runtime shared libs (~200 MB, downloaded on first run)
+      # Runtime: llama.cpp shared libs (~200 MB, downloaded on first run)
       - /mnt/ssd_speicher/generic/qwen3-tts/runtime:/app/runtime:rw
       # Speakers: voice profiles (optional override of built-in defaults)
       # - /mnt/ssd_speicher/generic/qwen3-tts/speakers:/app/speakers:rw

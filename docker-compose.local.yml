@@ -19,7 +19,7 @@ services:
       start_period: 300s
     restart: unless-stopped
     volumes:
-      # First startup downloads several gigabytes of models and runtime assets.
+      # First startup downloads several gigabytes of models and llama.cpp runtime.
       - ./local-data/models:/app/models:rw
       - ./local-data/runtime:/app/runtime:rw
       # Uncomment if you want to override the bundled speaker profiles locally.
