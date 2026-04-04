@@ -154,7 +154,7 @@ impl BurnAudioDecoder {
             .unwrap_or_default()
             .max(0) as usize;
 
-        let mut audio = final_wav.to_data().to_vec::<f32>()?;
+        let mut audio = final_wav.to_data().convert::<f32>().to_vec::<f32>()?;
         audio.truncate(valid_count);
 
         state.pre_conv_history = next_pre_conv_history;
